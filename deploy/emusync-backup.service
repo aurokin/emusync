@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot backup of the emusync save store
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/emusync/backup.env
+ExecStart=/opt/emusync/deploy/backup-saves.sh
