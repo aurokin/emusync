@@ -422,7 +422,12 @@ export const pullPairs = async (
         const perPairCmds = serverPairs.flatMap(({ source, target }) => [
             buildScpCommand(device, esc(source, isWindows), workDir, false),
             `rm -rf ${esc(target)}`,
-            `mv ${workDir}/${getFolderName(source)} ${esc(target)}`,
+            // Escape the joined path, not the pieces: workDir is already
+            // escaped above, but the basename came from config and a space in
+            // it used to split this mv into three arguments.
+            `mv ${esc(`${serverInfo.workDir}/${getFolderName(source)}`)} ${esc(
+                target,
+            )}`,
         ]);
 
         await runCommands([...setupCmds, ...perPairCmds], jobId);

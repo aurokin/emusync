@@ -21,19 +21,10 @@ records in Redis.
 A sync is a list of source/target directory pairs, built per emulator by
 `app/server/emulator_managers.ts`, transferred one pair at a time.
 
-Where both ends have `rsync`, a pair is one `rsync` invocation. Its flags are
-picked to match what the `scp` path already did rather than rsync's defaults:
-`--checksum` compares contents rather than size and mtime, because a
-same-size save rewritten within the timestamp granularity would otherwise be
-skipped; `-L` follows symlinks the way `scp -r` does; and `--delete-after`
-`--delay-updates` hold back deletions and file contents until the transfer
-finishes, so a transfer that fails deletes nothing and publishes no
-half-written saves. That is not full atomicity — an interrupted sync can leave
-new empty directories, a partial failure promotes whatever did transfer, and
-the delete phase is not itself atomic once it has started — but none of those
-lose data, and the `scp` path is not atomic either: it deletes the target
-before moving the staged copy into place. Where both ends do not have rsync, the pair is staged through the
-receiving side's `workDir` — the device's on a push, the server's on a pull:
+Where both ends have `rsync`, a pair is a single `rsync` invocation that
+updates the target in place. Where they do not, the pair is staged through
+the receiving side's `workDir` — the device's on a push, the server's on a
+pull:
 
 1. copy the source into the receiving side's `workDir`
 2. delete the target directory
@@ -43,16 +34,21 @@ Either way the pairs are interleaved, not batched — a failure part-way
 through leaves the remaining pairs untouched rather than several directories
 already deleted.
 
-Which path a device gets is probed per sync, not configured, so a device that
-gains rsync starts using it with no config change. The probe is
-the transfer's own flag list plus `--version`, run on the server and again
-over ssh on the device: it has to establish that rsync can run the options the
-transfer uses, not merely that the binary is on `PATH`, or an rsync too old
-for one of them would be selected and then fail mid-sync. Windows devices skip
-the
-probe entirely — they answer ssh with PowerShell, where its exit status would
-not mean what this reads it as. The job log records the reason whenever a
-device falls back.
+Which path a device gets is probed per sync rather than configured, so a
+device that gains rsync starts using it with no config change. The probe runs
+the transfer's own flags plus `--version`, on the server and again over ssh
+on the device: an rsync too old for one of those flags has to fail the probe
+rather than be chosen and then die mid-sync. Windows devices skip the probe —
+they answer ssh with PowerShell, where the exit status would not mean what
+this reads it as. The job log records the reason whenever a device falls
+back.
+
+The rsync flags are picked to match what the scp path already did rather than
+rsync's defaults, which matters more than it sounds: the default size-and-time
+check silently skips a same-size save rewritten within the timestamp
+granularity. Neither path is fully atomic. Each flag, and what is and is not
+guaranteed on failure, is documented at `RSYNC_FLAGS` in
+`app/server/backup.ts`.
 
 Transfers use `ssh` plus `rsync`/`scp` for everything except Nintendo Switch
 devices (`os: "nx"`), which use FTP and always stage. Dolphin on Android goes
@@ -134,6 +130,9 @@ bun run health   # format, then typecheck + test + lint
 runs. CI additionally builds and runs `deploy/smoke.sh`, which boots the
 built server against a throwaway config and asks it for its device list —
 `check` passes happily on a tree that cannot start.
+
+`AGENTS.md` covers repo conventions and the invariants worth knowing before
+changing the sync engine.
 
 ## Deployment
 

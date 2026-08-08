@@ -1,161 +1,173 @@
 # Repository Guidelines
 
-## Purpose
+Guidance for agentic coding assistants working in this repo. `README.md`
+explains what emusync is and how a sync actually works — read it first if you
+are touching the sync engine. `deploy/README.md` covers the save-store backup
+job. This file is about working in the code.
 
-- This file guides agentic coding assistants in this repo.
-- Keep changes minimal and consistent with existing patterns.
-- Update this file if tooling or conventions change.
+Keep changes minimal and consistent with existing patterns, and update this
+file when tooling or conventions change.
+
+## Invariants
+
+These are not style preferences. Each one was a bug, an outage, or a
+deliberate decision that looks like a bug. Do not "fix" them without asking.
+
+- **There is no authentication, on purpose.** The server binds every
+  interface and anyone who can reach it can start a sync that overwrites
+  saves. It is deployed to a private network only. Do not add auth, and do
+  not report its absence as a defect.
+- **This code deletes people's save files.** Anything touching
+  `app/server/backup.ts` is destructive by nature. Three rules hold there:
+  transfer pairs are interleaved, never batched (one failed move must not
+  leave several targets already deleted); every filesystem path reaching a
+  shell goes through `esc()` — `workDir` included, because it lands in an
+  `rm -rf`, and joined paths escaped whole rather than piecewise; and config
+  is verified before it is written, not after.
+  Know what `esc()` is and is not. It escapes spaces on POSIX and wraps the
+  string in double quotes on Windows — that is all. It is a correctness
+  guard against paths with spaces deleting the wrong directory, not a
+  sanitiser: `;`, backticks and `$()` in a configured path still reach
+  `bash`, and `device.ip` and `device.user` are interpolated into `ssh`/`scp`
+  strings with no escaping at all. (`device.port` is the one field that is
+  safe — `normalizePort` admits only integers 1–65535.) A hostile `db.json`
+  can therefore execute commands on the server — and since `/admin` writes
+  `db.json` with no authentication, "hostile `db.json`" means anyone who can
+  reach the port, not someone who already has a shell. That is accepted only
+  because the deployment is a private network; it is not a reason to relax
+  it further, and any change that widens what reaches `bash` makes an
+  already-reachable hole bigger.
+- **Three transfer paths.** Nintendo Switch devices (`os: "nx"`) use FTP,
+  chosen by OS in `getSyncTypeForOs` and branched on before anything else —
+  that one is deliberate. Everything else goes over ssh, and there the choice
+  between rsync and the scp stage-delete-move dance is probed per sync, never
+  hard-coded per device or per OS. The rsync flag set is
+  chosen to match scp's observable behaviour rather than rsync's defaults;
+  the reasoning is commented at `RSYNC_FLAGS` and should be read before
+  changing a flag.
+- **Job logs are a Redis LIST** at `<jobId>:log`, and `StoredSyncRecord`
+  omits `output` so no writer can persist a competing copy. Appending to an
+  array inside the record is what this replaced: it was a read-modify-write
+  that silently dropped concurrent lines.
+- **`eslint.config.js` reads the installed React version** instead of using
+  `"detect"`. Reverting that to `"detect"` breaks every ESLint 10 run — the
+  plugin's detection path calls an API ESLint 10 removed.
 
 ## Project Structure
 
-- Source lives in `app/` with subfolders for components, routes, contexts, theme, types, utilities.
-- Entry layout: `app/root.tsx`.
-- Routes are file-based under `app/routes/`.
-- Route manifest is centralized in `app/routes.ts`.
-- Route types are generated into `app/routes/+types` and `.react-router/types` (do not edit).
-- Server-side helpers live in `app/server/`.
-- Shared domain types live in `app/types/`.
-- UI/state code lives in `app/components/` and `app/contexts/`.
-- Client utilities live in `app/utilities/`.
-- Global styles live in `app/app.css`.
-- Static assets live in `public/`.
+- Source lives in `app/`: `components/`, `routes/`, `contexts/`, `theme/`,
+  `types/`, `utilities/`, `server/`.
+- Entry layout is `app/root.tsx`; routes are file-based under `app/routes/`
+  with the manifest in `app/routes.ts`.
+- Route types are generated into `.react-router/types` (do not edit).
+- Server-side helpers live in `app/server/`, shared domain types in
+  `app/types/`, server types in `app/server/types.ts`.
+- Global styles live in `app/app.css`; static assets in `public/`.
 - Build output goes to `build/client` and `build/server`.
 
 ## Configuration
 
-- React Router SSR config lives in `react-router.config.ts` (SSR stays enabled).
-- Vite plugins are wired in `vite.config.ts` (React Router, Tailwind, tsconfig paths).
-- TypeScript settings and the `~/` path alias live in `tsconfig.json`.
-- Prettier settings live in `.prettierrc` (`tabWidth: 4`).
-- ESLint config lives in `eslint.config.js`.
-- Tailwind is enabled via the Vite plugin (no standalone config file).
-- No Cursor or Copilot rule files exist in this repo currently.
+- React Router SSR config is in `react-router.config.ts` (SSR stays enabled).
+- `vite.config.ts` wires React Router and Tailwind. Path aliases use Vite 8's
+  native `resolve: { tsconfigPaths: true }` — the `vite-tsconfig-paths` plugin
+  was removed and now warns that it is redundant.
+- `vitest.config.ts` is separate and takes precedence for tests. A `test`
+  block in `vite.config.ts` is silently ignored.
+- The `~/` path alias lives in `tsconfig.json`. `baseUrl` is deliberately
+  absent: the relative `paths` mappings do not need it on TypeScript 5.9, and
+  leaving it out is what lets the tree compile under TypeScript 7, which
+  removed the option outright.
+- Prettier settings are in `.prettierrc` (`tabWidth: 4`). Note `proseWrap`
+  is unset, so Prettier will not rewrap Markdown prose; wrap it yourself.
+- ESLint config is in `eslint.config.js`; Tailwind has no standalone config.
 
 ## Package Manager
 
-- Scripts are defined in `package.json` and use `bunx` internally.
-- Use `bun run <script>` to execute scripts.
-- Use `bunx` for one-off CLI invocations.
+Scripts are defined in `package.json` and use `bunx` internally. Run them
+with `bun run <script>`; use `bunx` for one-off CLI invocations.
 
 ## Dev / Build / Run
 
-- `bun run dev`: start the dev server with HMR at `http://localhost:5173`.
-- `bun run build`: create the production build in `build/`.
-- `bun run start`: serve the built server bundle (defaults to port 3000).
-- `bun run typecheck`: run React Router typegen + TypeScript.
-- `bun run format`: format the repo with Prettier.
-- `bun run format:check`: verify formatting without writing files.
-- `bun run check`: run format check, typecheck, tests, and lint.
-- Docker: `docker build -t emu-react .` then `docker run -p 3000:3000 emu-react`.
+- `bun run dev` — dev server with HMR at `http://localhost:5173`.
+- `bun run build` — production build in `build/`.
+- `bun run start` — serve the built bundle (port 3000 by default).
+- `bun run typecheck` — React Router typegen + TypeScript.
+- `bun run format` / `format:check` — Prettier with and without writing.
+- `bun run check` — format check, typecheck, tests, lint. What CI runs.
+- `bun run health` — the same plus a reformat first. Use this locally.
+
+A `Dockerfile` exists but is not how this is deployed, is not built in CI,
+and is unverified. Production runs under systemd from a checkout; see
+`deploy/emusync.service` and the deployment section of `README.md`.
 
 ## Linting & Tests
 
-- ESLint is configured; run `bun run lint`.
-- Use `bun run typecheck` as the primary static analysis step.
-- Unit tests run with Vitest via `bun run test`.
+- Vitest via `bun run test`; a single file with `bunx vitest path/to/file`.
 - Prefer Vitest + React Testing Library for new tests.
-- Single test file: `bunx vitest path/to/file.test.tsx`.
-- Add `bun run check` to CI to validate formatting, type checks, tests, and linting.
+- CI (`.github/workflows/ci.yml`) runs `check`, then `build`, then
+  `deploy/smoke.sh`. The smoke step exists because `check` passes happily on
+  a tree that cannot boot — it starts the built server against a throwaway
+  config and asserts `/api/devices` returns a usable device list.
+- **Verify new tests by mutation.** Revert the fix the test covers, confirm
+  that test — and ideally only that test — fails, then restore. A test that
+  passes against the reintroduced bug is not protecting anything. This has
+  caught several of this repo's own tests.
+- Prove a check works by making it fail, not by trusting a zero exit. `bun -e`
+  in particular exits 0 on an uncaught throw once the script touches
+  `require()`, so a throwing validator always "passes".
 
 ## Local Setup
 
-- Redis is required for server flows; default is `redis://localhost:6379`.
-- Server startup requires `zip`/`unzip` on `PATH` (Dolphin Android sync).
-- Override Redis with `REDIS_URL` in environment when needed.
-- Document env vars in `.env.example` and never commit secrets.
+- Redis is required. Default `redis://localhost:6379`, override with
+  `REDIS_URL`. `initializeServer` connects lazily, so the process starts
+  without it and individual requests fail instead.
+- `zip`/`unzip` must be on `PATH` (Dolphin Android sync).
+- `rsync` is optional; without it ssh devices fall back to scp. Switch
+  devices (`os: "nx"`) use FTP either way and never reach the probe.
+- Document env vars in `.env.example` and never commit secrets. `db.json` is
+  gitignored — it holds real device addresses and paths.
 
-## Formatting
+## Code Conventions
 
-- Prettier is configured via `.prettierrc` with 4-space indentation.
-- Use double quotes for strings (matches existing code).
-- Let Prettier manage trailing commas and line wrapping.
-
-## Imports
-
-- Prefer the `~/` alias for anything under `app/`.
-- Keep import groups ordered: React/React Router, external libs, internal aliases, relative paths.
-- Use `import type` for type-only imports.
-- For MUI, import from explicit modules (e.g., `@mui/material/Box`).
-
-## TypeScript & Types
-
-- TypeScript runs in strict mode (see `tsconfig.json`).
-- Add explicit types for exported functions and public APIs when helpful.
-- Keep shared types in `app/types/` and server types in `app/server/types.ts`.
-- Prefer `type` aliases for unions; use `interface` for object shapes.
-- Avoid `any`; use `unknown` and narrow as needed.
-
-## React & Router Patterns
-
-- Use function components and hooks (no class components).
-- Route modules typically export `meta`, `loader`, `action`, and a default component.
-- Import route types from `./+types/<route>` (example: `import type { Route } ...`).
-- Loaders/actions should return `Response.json` for API responses.
-- Keep provider trees in `app/root.tsx` and use `ErrorBoundary` for routes.
+- Prettier owns formatting: 4-space indent, double quotes, trailing commas.
+- Prefer the `~/` alias for anything under `app/`; use `import type` for
+  type-only imports; import MUI from explicit modules
+  (`@mui/material/Box`).
+- TypeScript is strict. Avoid `any`; use `unknown` and narrow.
+- Function components and hooks only. Route modules export some of `meta`,
+  `loader`, `action`, and a default component, and import their types from
+  `./+types/<route>`.
+- Components are PascalCase, hooks are `useX`, contexts are `XContext` plus
+  `XProvider`, routes are lowercase by segment, API routes are
+  `routes/api.*.ts` with `$id` for dynamic params.
+- MUI `sx` is the primary styling mechanism; Tailwind is available but used
+  sparingly. Prefer the design tokens in `app/app.css`.
+- Accessibility is linted, not vibes: `eslint-plugin-jsx-a11y` runs on every
+  check and will fail the build.
 
 ## Server & API Conventions
 
-- API routes live in `app/routes/api.*.ts` and use loader functions.
-- Initialize server state with `initializeServer` before accessing devices.
-- Keep Redis logic in `app/server/redis.ts`; avoid direct Redis calls in routes.
-- Favor small helpers in `app/server/` over heavy logic in route files.
-- Return JSON via `Response.json` and set status codes when needed.
-
-## Data Fetching & Error Handling
-
-- Check `response.ok` before parsing JSON in client fetches.
-- Use `try/catch/finally` to manage loading and error states.
-- Log server errors with `console.error` and keep UI messages friendly.
-
-## State & Data Flow
-
-- Contexts manage cross-component state (see `DeviceContext`).
-- Keep async state transitions in one function (set loading/error/data together).
-- Store request flags (e.g., `requestInProgress`) alongside data.
-
-## Styling & UI
-
-- Tailwind is available; use utilities sparingly and keep them readable.
-- MUI `sx` props are the primary styling mechanism in components.
-- Prefer design tokens defined in `app/app.css` for colors and fonts.
-- Use responsive values with `{ xs, sm, md }` in MUI `sx`.
-
-## Accessibility
-
-- Use semantic HTML elements where possible.
-- Ensure clickable elements have clear focus/hover states.
-- Provide `aria-label` for interactive icons without text.
-
-## Naming Conventions
-
-- Components: PascalCase file and export names (e.g., `Header.tsx`).
-- Hooks: camelCase starting with `use` (e.g., `useDevices`).
-- Contexts: `XContext` plus `XProvider`.
-- Routes: lowercase by segment (e.g., `routes/home.tsx`).
-- API routes: `routes/api.*.ts` and dynamic params use `$id`.
-- Files: `.tsx` for React components; `.ts` for utilities/server.
-- Constants: `UPPER_SNAKE_CASE` when module-level constants are needed.
+- API routes live in `app/routes/api.*.ts`. Call `initializeServer` before
+  touching device state, and return `Response.json` with explicit status
+  codes.
+- Keep Redis access behind the helpers in `app/server/redis.ts`; routes
+  should not talk to the client directly.
+- Keep route files thin — logic belongs in small helpers under
+  `app/server/`.
+- Only one sync runs at a time. A second request gets a 409 carrying the
+  in-flight job id, because pulls stage through the single server `workDir`.
 
 ## Common Workflows
 
 - Adding a route: create `app/routes/*.tsx`, then update `app/routes.ts`.
 - Changing routes: run `bun run typecheck` to regenerate types.
-- Adding server logic: place helpers in `app/server/` and keep routes thin.
+- Adding server logic: put helpers in `app/server/`, keep routes thin.
 - Adding shared data types: define them in `app/types/`.
 
-## Performance Notes
+## Git Hooks
 
-- Avoid unnecessary re-renders; memoize heavy computations where needed.
-- Keep async state updates batched to minimize UI churn.
-- Reuse context values; avoid creating new objects in render paths.
-- Prefer Redis caching over repeated IO when possible.
-
-## Contribution Hygiene
-
-- Keep changes minimal and avoid editing generated files.
-- Use `bun run health` for all local validation runs (format + check).
-
-## Git hooks
-
-- Husky is configured for `pre-commit`.
-- `bun run format` runs automatically in the pre-commit hook and re-adds formatted files.
+Husky runs a `pre-commit` hook that formats **only the staged files** and
+re-adds them. It deliberately does not run `bun run format` over the whole
+repo — that swept unrelated working-tree changes into commits. The staged
+list is passed through a temp file because command substitution strips the
+NUL separators from `git diff -z`.

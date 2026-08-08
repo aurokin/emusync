@@ -268,6 +268,29 @@ describe("sync pair ordering", () => {
         expect(ranCommands()[1]).toBe("rm -rf /srv/emu\\ sync/work");
     });
 
+    it("escapes spaces in every pull path, staged basename included", async () => {
+        // The staged path is workDir joined with the source's basename. Both
+        // halves come from config, so escaping only the workDir leaves the mv
+        // splitting on the basename's space.
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/emu work" } as EmuServer;
+
+        await backup.pullPairs(
+            device,
+            [{ source: "/device/my saves", target: "/srv/my saves" }],
+            serverInfo,
+        );
+
+        expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
+            "rm -rf /srv/emu\\ work",
+            "mkdir -p /srv/emu\\ work",
+            "scp -P 22 -r root@10.0.0.10:/device/my\\ saves /srv/emu\\ work",
+            "rm -rf /srv/my\\ saves",
+            "mv /srv/emu\\ work/my\\ saves /srv/my\\ saves",
+        ]);
+    });
+
     it("emits the exact push sequence for a linux device", async () => {
         const device = buildDevice({ syncType: SyncType.ssh });
 
