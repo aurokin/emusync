@@ -131,3 +131,35 @@ export type SyncPair = {
     source: string;
     target: string;
 };
+
+// Fields a device cannot function without: shared by the add and update
+// endpoints so the two cannot drift on what "required" means.
+export const REQUIRED_DEVICE_FIELDS = [
+    "name",
+    "ip",
+    "port",
+    "user",
+    "password",
+    "os",
+    "workDir",
+] as const;
+
+// A whitespace-only value is blank: it passes a truthiness check and then gets
+// stripped on save, which would persist a device missing a field it needs.
+export const isMissingRequired = (value: unknown): boolean =>
+    value === undefined ||
+    value === null ||
+    value === "" ||
+    (typeof value === "string" && value.trim() === "") ||
+    value === false ||
+    value === 0;
+
+// The admin form's port field arrives as a string. verifyDevices requires a
+// positive integer, so a "22" saved verbatim returned 201 and then vanished
+// from the device list on the next load.
+export const normalizePort = (value: unknown): number | null => {
+    const port = typeof value === "string" ? Number(value.trim()) : value;
+    if (typeof port !== "number" || !Number.isInteger(port)) return null;
+    if (port < 1 || port > 65535) return null;
+    return port;
+};

@@ -267,6 +267,26 @@ describe("sync pair ordering", () => {
         ]);
     });
 
+    it("escapes spaces in every push path, workDir included", async () => {
+        // workDir is operator-supplied and lands in an rm -rf on the device.
+        const device = buildDevice({
+            syncType: SyncType.ssh,
+            workDir: "/tmp/emu work",
+        });
+
+        await backup.pushPairs(device, [
+            { source: "/srv/my saves", target: "/device/my saves" },
+        ]);
+
+        expect(ranCommands()).toEqual([
+            "ssh -p 22 root@10.0.0.10 'rm -rf /tmp/emu\\ work'",
+            "ssh -p 22 root@10.0.0.10 'mkdir /tmp/emu\\ work'",
+            "scp -P 22 -r /srv/my\\ saves root@10.0.0.10:/tmp/emu\\ work",
+            "ssh -p 22 root@10.0.0.10 'rm -rf /device/my\\ saves'",
+            "ssh -p 22 root@10.0.0.10 'mv /tmp/emu\\ work/my\\ saves /device/my\\ saves'",
+        ]);
+    });
+
     it("emits the exact pull sequence for a linux device", async () => {
         const device = buildDevice({ syncType: SyncType.ssh });
         const serverInfo = { workDir: "/srv/work" } as EmuServer;
@@ -301,10 +321,10 @@ describe("sync pair ordering", () => {
 
         expect(ranCommands()).toEqual([
             `ssh -p 22 root@10.0.0.10 'if (Test-Path -Path "C:/Users/auro/.emusync_tmp" -PathType Container) { rm -r "C:/Users/auro/.emusync_tmp" }'`,
-            "ssh -p 22 root@10.0.0.10 'mkdir C:/Users/auro/.emusync_tmp'",
-            "scp -P 22 -r /srv/retroarch root@10.0.0.10:C:/Users/auro/.emusync_tmp",
+            `ssh -p 22 root@10.0.0.10 'mkdir "C:/Users/auro/.emusync_tmp"'`,
+            `scp -P 22 -r /srv/retroarch root@10.0.0.10:"C:/Users/auro/.emusync_tmp"`,
             `ssh -p 22 root@10.0.0.10 'if (Test-Path -Path "D:/RetroArch/saves" -PathType Container) { rm -r "D:/RetroArch/saves" }'`,
-            `ssh -p 22 root@10.0.0.10 'mv C:/Users/auro/.emusync_tmp/retroarch "D:/RetroArch/saves"'`,
+            `ssh -p 22 root@10.0.0.10 'mv "C:/Users/auro/.emusync_tmp/retroarch" "D:/RetroArch/saves"'`,
         ]);
     });
 

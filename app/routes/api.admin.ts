@@ -23,9 +23,13 @@ export async function action({ request }: { request: Request }) {
     const updatedConfig = await updateServerConfig(updates);
 
     if (!updatedConfig) {
+        // Rejected, not failed: the update would have left a path blank, and
+        // the stored config is untouched.
         return Response.json(
-            { error: "Failed to update server config" },
-            { status: 500 },
+            {
+                error: "Every server path must be set — the change was not saved",
+            },
+            { status: 400 },
         );
     }
 

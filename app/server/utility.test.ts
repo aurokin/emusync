@@ -95,4 +95,45 @@ describe("convertEmuDeviceToSimpleDevice", () => {
             Emulator.yuzu,
         ]);
     });
+
+    it("enables android yuzu on the dump dir alone", () => {
+        // yuzuDroid is read by nothing; requiring it meant a correctly
+        // configured device was not offered yuzu at all.
+        const device = buildDevice({
+            os: EmuOs.android,
+            yuzuDroidDump: "/sdcard/yuzu/dump",
+        });
+
+        expect(convertEmuDeviceToSimpleDevice(device).emulatorsEnabled).toEqual(
+            [Emulator.yuzu],
+        );
+    });
+
+    it("does not advertise android yuzu on yuzuSave alone", () => {
+        // manageYuzu routes Android through the dump dir, so yuzuSave by
+        // itself would offer a sync that copies nothing.
+        const device = buildDevice({
+            os: EmuOs.android,
+            yuzuSave: "/sdcard/yuzu",
+        });
+
+        expect(convertEmuDeviceToSimpleDevice(device).emulatorsEnabled).toEqual(
+            [],
+        );
+    });
+
+    it("does not advertise an emulator configured with a blank path", () => {
+        // A blank path passed the typeof check and enabled the emulator; the
+        // manager then produced no pairs and the sync reported success having
+        // copied nothing.
+        const device = buildDevice({
+            cemuSave: "",
+            azahar: "   ",
+            melonds: "/emu/melonds",
+        });
+
+        expect(convertEmuDeviceToSimpleDevice(device).emulatorsEnabled).toEqual(
+            [Emulator.melonds],
+        );
+    });
 });

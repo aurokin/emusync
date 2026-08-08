@@ -282,13 +282,11 @@ const manageYuzu = (
         if (!device.yuzuSave) return [];
         return simpleManage(serverInfo.yuzuSave, device.yuzuSave, push);
     } else {
-        if (push && !device.yuzuDroidDump) return [];
-        if (!push && !device.yuzuSave) return [];
-        return [
-            {
-                source: push ? serverInfo.yuzuSave : device.yuzuSave!,
-                target: push ? device.yuzuDroidDump! : serverInfo.yuzuSave,
-            },
-        ];
+        // Both directions go through the dump directory, as dolphin does on
+        // Android: the emulator's own save dir is app-private and not
+        // reachable over sftp. Pulling from yuzuSave instead meant an Android
+        // device could be listed as yuzu-capable and then pull nothing.
+        if (!device.yuzuDroidDump) return [];
+        return simpleManage(serverInfo.yuzuSave, device.yuzuDroidDump, push);
     }
 };

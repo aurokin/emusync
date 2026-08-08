@@ -8,7 +8,11 @@ export const convertEmuDeviceToSimpleDevice = (
     device: EmuDevice,
 ): SimpleDevice => {
     const emulatorsEnabled: Emulator[] = [];
-    const has = (v: unknown): v is string => typeof v === "string";
+    // A blank path is not a configured path. Accepting "" here advertised an
+    // emulator whose manager then produced no pairs, so the sync reported
+    // success having copied nothing.
+    const has = (v: unknown): v is string =>
+        typeof v === "string" && v.trim().length > 0;
 
     if (has(device.cemuSave)) emulatorsEnabled.push(Emulator.cemu);
 
@@ -46,11 +50,14 @@ export const convertEmuDeviceToSimpleDevice = (
     if (has(device.xemuSave)) emulatorsEnabled.push(Emulator.xemu);
     if (has(device.xeniaSave)) emulatorsEnabled.push(Emulator.xenia);
 
+    // Only yuzuDroidDump is required: it is the one path manageYuzu actually
+    // uses on Android. Requiring yuzuDroid as well meant a device could be
+    // listed as yuzu-capable on the strength of a field nothing reads.
     const yuzuAndroid =
-        device.os === EmuOs.android &&
-        has(device.yuzuDroid) &&
-        has(device.yuzuDroidDump);
-    const yuzuOther = has(device.yuzuSave);
+        device.os === EmuOs.android && has(device.yuzuDroidDump);
+    // Android is excluded: manageYuzu routes it through the dump dir, so a
+    // yuzuSave-only Android device would advertise yuzu and sync nothing.
+    const yuzuOther = device.os !== EmuOs.android && has(device.yuzuSave);
     if (yuzuAndroid || yuzuOther) emulatorsEnabled.push(Emulator.yuzu);
 
     return {

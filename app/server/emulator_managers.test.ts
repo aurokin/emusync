@@ -175,7 +175,10 @@ describe("emulator managers", () => {
         ]);
     });
 
-    it("handles android yuzu sync", () => {
+    it("routes android yuzu through the dump dir in both directions", () => {
+        // The emulator's own save dir is app-private, so both directions go
+        // through the dump dir — as dolphin does on Android. Pulling from
+        // yuzuSave meant an Android device advertised yuzu and pulled nothing.
         const device = buildDevice({
             os: EmuOs.android,
             yuzuSave: "/sdcard/yuzu",
@@ -192,10 +195,22 @@ describe("emulator managers", () => {
         ]);
         expect(manage(device, serverInfo, false)).toEqual([
             {
-                source: device.yuzuSave,
+                source: device.yuzuDroidDump,
                 target: serverInfo.yuzuSave,
             },
         ]);
+    });
+
+    it("produces no android yuzu pairs without a dump dir", () => {
+        const device = buildDevice({
+            os: EmuOs.android,
+            yuzuSave: "/sdcard/yuzu",
+        });
+        const serverInfo = buildServer();
+        const manage = getManageFn(Emulator.yuzu);
+
+        expect(manage(device, serverInfo, true)).toEqual([]);
+        expect(manage(device, serverInfo, false)).toEqual([]);
     });
 
     it("maps pcsx2 to the same memcards dir nethersx2 uses", () => {

@@ -320,7 +320,13 @@ export default function Admin() {
     // Load server config
     useEffect(() => {
         fetch("/api/admin")
-            .then((res) => res.json())
+            // Without the status check a 404/500 error body was set as the
+            // config, so the form showed { error: ... } as the saved state and
+            // a subsequent save would have written it back.
+            .then((res) => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then((data) => {
                 setServerConfig(data);
                 setServerLoading(false);
@@ -342,7 +348,10 @@ export default function Admin() {
 
     const fetchDevices = () => {
         fetch("/api/admin/devices")
-            .then((res) => res.json())
+            .then((res) => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then((data) => {
                 setDevices(data);
                 setDevicesLoading(false);

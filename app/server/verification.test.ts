@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EmuServer } from "./types";
 import { EmuOs, SyncType } from "./types";
 import {
+    SERVER_PATH_FIELDS,
     parseInfo,
     parseOs,
     serverHasFolders,
     shouldLaunch,
     verifyDevices,
+    verifyServer,
 } from "./verification";
 
 type DeviceInput = {
@@ -125,6 +127,86 @@ describe("verifyDevices", () => {
         expect(result[1].os).toBe(EmuOs.nx);
         expect(result[1].syncType).toBe(SyncType.ftp);
     });
+
+    it.each(["name", "ip", "user", "password", "os"])(
+        "rejects a device whose %s is blank",
+        (field) => {
+            // Presence alone used to be enough, so "" produced a device that
+            // rendered in the UI and built malformed ssh commands.
+            const blank = { ...buildDeviceInput(), [field]: "   " };
+            expect(verifyDevices([blank])).toEqual([]);
+
+            const missing: Record<string, unknown> = { ...buildDeviceInput() };
+            delete missing[field];
+            expect(verifyDevices([missing])).toEqual([]);
+        },
+    );
+
+    it.each([
+        ["a fractional port", 22.5],
+        ["a zero port", 0],
+        ["a port above the valid range", 70000],
+        ["a non-numeric port", "ssh"],
+    ])("rejects a device with %s", (_label, port) => {
+        expect(verifyDevices([{ ...buildDeviceInput(), port }])).toEqual([]);
+    });
+
+    it("accepts and normalizes a port stored as a string", () => {
+        // The admin form used to save the port verbatim, so existing records
+        // hold "22". Rejecting those would delete devices from the fleet on
+        // deploy rather than repair them.
+        const [device] = verifyDevices([{ ...buildDeviceInput(), port: "22" }]);
+
+        expect(device.port).toBe(22);
+    });
+});
+
+describe("verifyServer", () => {
+    it("accepts a fully populated config", () => {
+        const serverInfo = buildServer();
+        expect(verifyServer(serverInfo)).toEqual(serverInfo);
+    });
+
+    it("requires exactly the documented set of server fields", () => {
+        // Spelled out rather than derived: iterating SERVER_PATH_FIELDS below
+        // cannot catch a field being dropped from that list.
+        expect([...SERVER_PATH_FIELDS].sort()).toEqual(
+            [
+                "azahar",
+                "cemuSave",
+                "dolphinGC",
+                "dolphinWii",
+                "melonds",
+                "mupenFzSave",
+                "nethersx2Save",
+                "ppssppSave",
+                "ppssppState",
+                "retroarchRgState",
+                "retroarchSave",
+                "retroarchState",
+                "rpcs3Save",
+                "ryujinxSave",
+                "switchSave",
+                "vita3kSave",
+                "workDir",
+                "xemuSave",
+                "xeniaSave",
+                "yuzuSave",
+            ].sort(),
+        );
+    });
+
+    it.each(SERVER_PATH_FIELDS)(
+        "rejects a config whose %s is blank or missing",
+        (field) => {
+            // Each of these reaches fs.access, an rm -rf or an scp target.
+            expect(verifyServer({ ...buildServer(), [field]: "" })).toBeNull();
+
+            const missing: Record<string, unknown> = { ...buildServer() };
+            delete missing[field];
+            expect(verifyServer(missing)).toBeNull();
+        },
+    );
 });
 
 describe("server verification", () => {

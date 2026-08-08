@@ -1,4 +1,8 @@
 import fs from "node:fs/promises";
+// Captured before any spy is installed so the recorders below can call through.
+const fsReadFile = fs.readFile;
+const fsWriteFile = fs.writeFile;
+const fsRename = fs.rename;
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -149,6 +153,131 @@ describe("devices", () => {
     it("returns null for an unknown device lookup", async () => {
         expect(await db.getDevice("ghost")).toBeNull();
         expect(await db.getDevice("herb")).toMatchObject({ name: "herb" });
+    });
+});
+
+describe("blank fields", () => {
+    it("drops blank fields when adding rather than storing empty strings", async () => {
+        await db.addDevice({
+            name: "odin",
+            os: "android",
+            cemuSave: "",
+            azahar: "   ",
+            workDir: "/sdcard/work",
+        });
+
+        const saved = await read();
+        const odin = saved.devices.find(
+            (d: { name: string }) => d.name === "odin",
+        );
+        expect(odin).toEqual({
+            name: "odin",
+            os: "android",
+            workDir: "/sdcard/work",
+        });
+    });
+
+    it("treats a blank update as unsetting the field", async () => {
+        // Merging "" would leave the old path in place, so clearing a field in
+        // the admin form would silently do nothing.
+        await db.updateDevice("herb", { ip: "herb.home.arpa", port: 22 });
+        await db.addDevice({ name: "odin", os: "android", cemuSave: "/a" });
+
+        expect(await db.updateDevice("odin", { cemuSave: "" })).toEqual({
+            success: true,
+        });
+
+        const saved = await read();
+        const odin = saved.devices.find(
+            (d: { name: string }) => d.name === "odin",
+        );
+        expect(odin).not.toHaveProperty("cemuSave");
+    });
+
+    it("refuses a blank server field and leaves the stored config alone", async () => {
+        // Every server path is required, so unsetting one would persist a
+        // config that can no longer be loaded.
+        const before = await read();
+
+        expect(await db.updateServerConfig({ cemuSave: "" })).toBeNull();
+
+        expect(await read()).toEqual(before);
+    });
+});
+
+describe("concurrent writes", () => {
+    // Recording the I/O order is what makes these deterministic. A test that
+    // only checks the final device list depends on filesystem scheduling to
+    // produce the losing interleaving; the queue's actual guarantee is that no
+    // load ever starts between another mutation's load and its rename.
+    const recordIo = () => {
+        const ops: string[] = [];
+        const readSpy = vi.spyOn(fs, "readFile");
+        const writeSpy = vi.spyOn(fs, "writeFile");
+        const renameSpy = vi.spyOn(fs, "rename");
+        readSpy.mockImplementation((async (
+            ...args: Parameters<typeof fs.readFile>
+        ) => {
+            ops.push("read");
+            return (fsReadFile as typeof fs.readFile)(...args);
+        }) as typeof fs.readFile);
+        writeSpy.mockImplementation((async (
+            ...args: Parameters<typeof fs.writeFile>
+        ) => {
+            ops.push("write");
+            return (fsWriteFile as typeof fs.writeFile)(...args);
+        }) as typeof fs.writeFile);
+        renameSpy.mockImplementation((async (
+            ...args: Parameters<typeof fs.rename>
+        ) => {
+            ops.push("rename");
+            return (fsRename as typeof fs.rename)(...args);
+        }) as typeof fs.rename);
+        return {
+            ops,
+            restore: () => {
+                readSpy.mockRestore();
+                writeSpy.mockRestore();
+                renameSpy.mockRestore();
+            },
+        };
+    };
+
+    it("never interleaves one mutation's load with another's write", async () => {
+        const io = recordIo();
+
+        await Promise.all([
+            db.addDevice({ name: "odin", os: "android" }),
+            db.addDevice({ name: "thor", os: "android" }),
+        ]);
+
+        expect(io.ops).toEqual([
+            "read",
+            "write",
+            "rename",
+            "read",
+            "write",
+            "rename",
+        ]);
+        io.restore();
+
+        const saved = await read();
+        expect(saved.devices.map((d: { name: string }) => d.name)).toEqual([
+            "herb",
+            "haste",
+            "odin",
+            "thor",
+        ]);
+    });
+
+    it("leaves no temp files behind after overlapping writes", async () => {
+        await Promise.all([
+            db.addDevice({ name: "odin", os: "android" }),
+            db.addDevice({ name: "thor", os: "android" }),
+            db.updateServerConfig({ workDir: "/srv/work2" }),
+        ]);
+
+        expect(await fs.readdir(dbDir)).toEqual(["db.json"]);
     });
 });
 

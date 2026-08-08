@@ -200,18 +200,28 @@ export const pushPairs = async (
                 device,
                 buildRm(esc(device.workDir, isWindows), isWindows),
             ),
-            buildSshCommand(device, `mkdir ${device.workDir}`),
+            buildSshCommand(device, `mkdir ${esc(device.workDir, isWindows)}`),
         ];
         // Stage, delete and move one pair at a time. Batching every delete
         // ahead of every move meant one failed move left several target
         // directories already deleted, with the only copies sitting in the
         // workDir that the next run wipes first.
+        // Every path that reaches a shell is escaped, including workDir: it is
+        // operator-supplied and lands in an rm -rf.
         const perPairCmds = serverPairs.flatMap(({ source, target }) => [
-            buildScpCommand(device, source, device.workDir, true),
+            buildScpCommand(
+                device,
+                esc(source),
+                esc(device.workDir, isWindows),
+                true,
+            ),
             buildSshCommand(device, buildRm(esc(target, isWindows), isWindows)),
             buildSshCommand(
                 device,
-                `mv ${device.workDir}/${getFolderName(source)} ${esc(target, isWindows)}`,
+                `mv ${esc(
+                    `${device.workDir}/${getFolderName(source)}`,
+                    isWindows,
+                )} ${esc(target, isWindows)}`,
             ),
         ]);
 

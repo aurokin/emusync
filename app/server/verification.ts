@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import type { EmuDevice, EmuServer } from "./types";
 import { EmuOs } from "./types";
 import { getSyncTypeForOs } from "./utility";
+import { normalizePort } from "./types";
 
 // Database interface for db.json
 interface Database {
@@ -37,44 +38,65 @@ const serverHasBinaries = async (binaries: string[]) => {
     return true;
 };
 
+// Presence is not enough: `"name" in device` is satisfied by undefined, null
+// and "", each of which produces a device that renders in the UI and then
+// builds nonsense commands. A field must actually hold a usable value.
+const hasText = (record: object, key: string): boolean => {
+    const value = (record as Record<string, unknown>)[key];
+    return typeof value === "string" && value.trim().length > 0;
+};
+
+const DEVICE_TEXT_FIELDS = ["name", "ip", "user", "password", "os"];
+
 const isEmuDevice = (device: unknown): device is EmuDevice => {
+    if (device === null || typeof device !== "object") return false;
+    // normalizePort, not a bare typeof check: the admin form used to store the
+    // port verbatim as a string, so existing records hold "22" and rejecting
+    // them here would make those devices vanish from the fleet. It also
+    // applies the same 1-65535 bound the write endpoints enforce.
     return (
-        device !== null &&
-        typeof device === "object" &&
-        "name" in device &&
-        "ip" in device &&
-        "port" in device &&
-        "user" in device &&
-        "password" in device &&
-        "os" in device
+        DEVICE_TEXT_FIELDS.every((field) => hasText(device, field)) &&
+        normalizePort((device as Record<string, unknown>).port) !== null
     );
 };
 
+// Every one of these reaches fs.access, an rm -rf or an scp target, so a blank
+// or missing value has to fail verification rather than travel as "".
+export const SERVER_PATH_FIELDS = [
+    "cemuSave",
+    "azahar",
+    "dolphinGC",
+    "dolphinWii",
+    "mupenFzSave",
+    "nethersx2Save",
+    "melonds",
+    "ppssppSave",
+    "ppssppState",
+    "retroarchSave",
+    "retroarchState",
+    "retroarchRgState",
+    "rpcs3Save",
+    "ryujinxSave",
+    "switchSave",
+    "vita3kSave",
+    "xemuSave",
+    "xeniaSave",
+    "yuzuSave",
+    "workDir",
+];
+
 const isEmuServer = (server: unknown): server is EmuServer => {
-    return (
-        server !== null &&
-        typeof server === "object" &&
-        "cemuSave" in server &&
-        "azahar" in server &&
-        "dolphinGC" in server &&
-        "dolphinWii" in server &&
-        "mupenFzSave" in server &&
-        "nethersx2Save" in server &&
-        "melonds" in server &&
-        "ppssppSave" in server &&
-        "ppssppState" in server &&
-        "retroarchSave" in server &&
-        "retroarchState" in server &&
-        "retroarchRgState" in server &&
-        "rpcs3Save" in server &&
-        "ryujinxSave" in server &&
-        "switchSave" in server &&
-        "vita3kSave" in server &&
-        "xemuSave" in server &&
-        "xeniaSave" in server &&
-        "yuzuSave" in server &&
-        "workDir" in server
+    if (server === null || typeof server !== "object") return false;
+    const missing = SERVER_PATH_FIELDS.filter(
+        (field) => !hasText(server, field),
     );
+    if (missing.length > 0) {
+        console.error(
+            `Server config is missing or blank: ${missing.join(", ")}`,
+        );
+        return false;
+    }
+    return true;
 };
 
 export const parseOs = (os: string): EmuOs => {
@@ -100,7 +122,12 @@ export const verifyDevices = (devices: unknown[]): EmuDevice[] => {
         .filter(isEmuDevice)
         .map((device) => {
             const os = parseOs(device.os as string);
-            return { ...device, os, syncType: getSyncTypeForOs(os) };
+            return {
+                ...device,
+                os,
+                port: normalizePort(device.port)!,
+                syncType: getSyncTypeForOs(os),
+            };
         });
 
     const sortedDevices = verifiedDevices.sort((a, b) => {
