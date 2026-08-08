@@ -41,9 +41,10 @@ export const createCmd = async (
     let failed = false;
     let settled = false;
     console.log(`?: ${cmd}`);
-    await appendJobLog(jobId, `CMD: ${cmd}`);
 
-    return new Promise((resolve, reject) => {
+    // Attach all handlers synchronously: a fast command can exit before any
+    // await completes, and an unobserved exit event would hang the job.
+    const done = new Promise((resolve, reject) => {
         const rejectOnce = (err: unknown) => {
             if (settled) return;
             settled = true;
@@ -97,6 +98,9 @@ export const createCmd = async (
             }
         });
     });
+
+    await appendJobLog(jobId, `CMD: ${cmd}`);
+    return done;
 };
 export const buildSshCommand = (device: EmuDevice, cmd: string) => {
     return `ssh -p ${device.port} ${device.user}@${device.ip} '${cmd}'`;
