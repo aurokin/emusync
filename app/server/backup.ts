@@ -119,6 +119,126 @@ export const buildScpCommand = (
         return `scp -P ${device.port} -r ${device.user}@${device.ip}:${source} ${target}`;
     }
 };
+// A trailing slash on an rsync source means "the contents of", which is what
+// makes --delete mirror a directory instead of nesting it one level deeper.
+//
+// It is applied to the destination as well, purely for symmetry: rsync follows
+// a destination that is a symlink to a directory whether or not the slash is
+// there (verified both ways on the server), so the slash is not what decides
+// that. Following it is also the behaviour we want. The scp path instead
+// `rm -rf`s the symlink and drops a real directory in its place, silently
+// undoing an operator's deliberate indirection and orphaning whatever the link
+// pointed at; rsync mirrors into the referent, which is the location the
+// configured path actually names.
+const asDir = (path: string) => (path.endsWith("/") ? path : `${path}/`);
+
+// Every flag here is chosen against what the scp path already did, not against
+// rsync's defaults: the point of this path is to change how a sync gets there,
+// not what it does.
+//
+//   -rLt          scp -r follows symlinks and copies what they point at, so -L
+//                 rather than -a's -l (verified against scp on the server).
+//                 -a's -pgo are dropped: ownership and permission bits are
+//                 meaningless across Linux, Android FUSE storage and Windows,
+//                 and failing to set them is the usual spurious non-zero exit.
+//   --checksum    Not optional. rsync's default quick check skips any file
+//                 whose size and mtime match, and emulator saves are often
+//                 fixed-size; verified on the server that the default flags
+//                 left stale contents in place and reported success. It costs
+//                 a full read of both trees, which these are small enough for.
+//   --delete-after
+//                 rsync 3 otherwise deletes during the transfer, so a dropped
+//                 connection would commit those deletions. Deferred, a failed
+//                 transfer never reaches the delete phase.
+//   --delay-updates
+//                 File contents land in a holding area and are renamed into
+//                 place at the end, so an aborted transfer publishes no
+//                 half-written saves.
+//   --protect-args
+//                 rsync otherwise re-splits the remote path in the remote
+//                 shell, so a path with a space would need a second layer of
+//                 quoting on top of esc(). Present since rsync 3.0 (renamed
+//                 --secluded-args in 3.2.4, old spelling kept as an alias).
+//
+// On failure semantics, since the last two flags invite over-reading and this
+// keeps coming up in review: they are not a transaction. An interrupted sync
+// can leave new empty directories, the delete phase is not atomic once it has
+// begun, a source entry that changes type forces its counterpart to be removed
+// early, and a per-file error that rsync survives still promotes whatever did
+// transfer. All of that is accepted, because the alternative is worse, not
+// better: the scp path this replaces deletes the *entire* target
+// unconditionally before moving the staged copy into place (the buildRm call
+// in pushPairs below), so every one of those cases is one where rsync destroys
+// strictly less than scp did.
+const RSYNC_FLAGS = [
+    "-rLt",
+    "--checksum",
+    "--delete-after",
+    "--delay-updates",
+    "--protect-args",
+];
+
+export const buildRsyncCommand = (
+    device: EmuDevice,
+    source: string,
+    target: string,
+    push: boolean,
+) => {
+    const flags = [...RSYNC_FLAGS, `-e ${esc(`ssh -p ${device.port}`)}`].join(
+        " ",
+    );
+    const remote = (path: string) => `${device.user}@${device.ip}:${path}`;
+    if (push) {
+        return `rsync ${flags} ${esc(asDir(source))} ${esc(remote(asDir(target)))}`;
+    }
+    return `rsync ${flags} ${esc(remote(asDir(source)))} ${esc(asDir(target))}`;
+};
+
+// rsync has to exist on both ends, and on this fleet it does not: the server
+// and the Linux devices have it, the Termux devices do not ship it in their
+// default package set, and the Windows box answers ssh with PowerShell. So
+// this probes instead of assuming, and every device that fails the probe keeps
+// the scp stage-delete-move path unchanged.
+//
+// A probe rather than a per-device config flag: it costs one round trip
+// against a whole transfer, there is nothing to keep in sync when a device
+// gains rsync, and a probe that itself fails degrades to the path that already
+// worked rather than to a broken sync.
+// The probe runs the transfer's own flags rather than asking whether the
+// binary exists: `command -v rsync` passes on an rsync too old for these
+// options (the 2.6.9 Apple still ships, for one) and the transfer would then
+// die on an unknown option instead of taking the scp path that works. Built
+// from RSYNC_FLAGS, not a copy of it, so a flag can never be added to the
+// transfer without the probe starting to require it.
+const RSYNC_PROBE = `rsync ${RSYNC_FLAGS.join(" ")} --version >/dev/null`;
+
+const canUseRsync = async (device: EmuDevice, jobId?: string) => {
+    if (device.os === EmuOs.windows) {
+        await appendJobLog(jobId, "RSYNC: windows device, using scp");
+        return false;
+    }
+    const usable = async (cmd: string) => {
+        try {
+            await createCmd(cmd, jobId);
+            return true;
+        } catch {
+            return false;
+        }
+    };
+    if (!(await usable(RSYNC_PROBE))) {
+        await appendJobLog(jobId, "RSYNC: unusable on the server, using scp");
+        return false;
+    }
+    if (!(await usable(buildSshCommand(device, RSYNC_PROBE)))) {
+        await appendJobLog(
+            jobId,
+            `RSYNC: unusable on ${device.name}, using scp`,
+        );
+        return false;
+    }
+    return true;
+};
+
 export const connectionTest = async (device: EmuDevice) => {
     if (device.syncType === SyncType.ftp) {
         const client = new FtpClient();
@@ -193,6 +313,16 @@ export const pushPairs = async (
         } finally {
             client.close();
         }
+    } else if (await canUseRsync(device, jobId)) {
+        // No workDir, no delete step: rsync updates the target in place, so
+        // there is never a moment where the target is gone and the only copy
+        // is sitting in a staging directory the next run wipes first.
+        await runCommands(
+            serverPairs.map(({ source, target }) =>
+                buildRsyncCommand(device, source, target, true),
+            ),
+            jobId,
+        );
     } else {
         const isWindows = device.os === EmuOs.windows;
         const setupCmds = [
@@ -274,6 +404,16 @@ export const pullPairs = async (
         } finally {
             client.close();
         }
+    } else if (await canUseRsync(device, jobId)) {
+        // serverInfo.workDir is untouched on this path — see pushPairs. That
+        // also removes the reason pulls cannot overlap, but the single-job
+        // lock stays: the scp path below still stages through it.
+        await runCommands(
+            serverPairs.map(({ source, target }) =>
+                buildRsyncCommand(device, source, target, false),
+            ),
+            jobId,
+        );
     } else {
         const isWindows = device.os === EmuOs.windows;
         // workDir is escaped here too: it reaches an rm -rf, and leaving it

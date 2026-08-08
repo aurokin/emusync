@@ -19,21 +19,45 @@ admin page at `/admin` edits that file; nothing else is stateful except job
 records in Redis.
 
 A sync is a list of source/target directory pairs, built per emulator by
-`app/server/emulator_managers.ts`. Each pair is transferred one at a time,
-staged through the receiving side's `workDir` — the device's on a push, the
-server's on a pull:
+`app/server/emulator_managers.ts`, transferred one pair at a time.
+
+Where both ends have `rsync`, a pair is one `rsync` invocation. Its flags are
+picked to match what the `scp` path already did rather than rsync's defaults:
+`--checksum` compares contents rather than size and mtime, because a
+same-size save rewritten within the timestamp granularity would otherwise be
+skipped; `-L` follows symlinks the way `scp -r` does; and `--delete-after`
+`--delay-updates` hold back deletions and file contents until the transfer
+finishes, so a transfer that fails deletes nothing and publishes no
+half-written saves. That is not full atomicity — an interrupted sync can leave
+new empty directories, a partial failure promotes whatever did transfer, and
+the delete phase is not itself atomic once it has started — but none of those
+lose data, and the `scp` path is not atomic either: it deletes the target
+before moving the staged copy into place. Where both ends do not have rsync, the pair is staged through the
+receiving side's `workDir` — the device's on a push, the server's on a pull:
 
 1. copy the source into the receiving side's `workDir`
 2. delete the target directory
 3. move the staged copy into its place
 
-Interleaved per pair, not batched — a failure part-way through leaves the
-remaining pairs untouched rather than several directories already deleted.
+Either way the pairs are interleaved, not batched — a failure part-way
+through leaves the remaining pairs untouched rather than several directories
+already deleted.
 
-Transfers use `ssh`/`scp` for everything except Nintendo Switch devices
-(`os: "nx"`), which use FTP. Dolphin on Android goes through a zip in the
-device's dump directory because the emulator's own save directory is
-app-private.
+Which path a device gets is probed per sync, not configured, so a device that
+gains rsync starts using it with no config change. The probe is
+the transfer's own flag list plus `--version`, run on the server and again
+over ssh on the device: it has to establish that rsync can run the options the
+transfer uses, not merely that the binary is on `PATH`, or an rsync too old
+for one of them would be selected and then fail mid-sync. Windows devices skip
+the
+probe entirely — they answer ssh with PowerShell, where its exit status would
+not mean what this reads it as. The job log records the reason whenever a
+device falls back.
+
+Transfers use `ssh` plus `rsync`/`scp` for everything except Nintendo Switch
+devices (`os: "nx"`), which use FTP and always stage. Dolphin on Android goes
+through a zip in the device's dump directory because the emulator's own save
+directory is app-private.
 
 Only one sync runs at a time. A second request gets a 409 carrying the id of
 the job that holds the slot; pulls stage through the single server `workDir`,
@@ -49,6 +73,8 @@ so concurrent syncs would overwrite each other's staged copies.
 - `zip` and `unzip` on `PATH` (Dolphin Android sync)
 - `ssh`/`scp`, and non-interactive SSH from the server to every device
   except Nintendo Switch (`os: "nx"`), which uses FTP
+- `rsync` optionally, on the server and on a device, for the faster
+  in-place path. Absent on either end, that device uses `scp`
 
 ## Configuration
 

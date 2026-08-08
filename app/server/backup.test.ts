@@ -65,6 +65,13 @@ const buildDevice = (overrides: Partial<EmuDevice> = {}): EmuDevice => ({
 
 const killMock = vi.fn();
 
+// Mirrors RSYNC_PROBE in backup.ts, which is deliberately not exported: the
+// point of the sequence assertions is that they name the literal command that
+// reaches a shell.
+const RSYNC_FLAGS =
+    "-rLt --checksum --delete-after --delay-updates --protect-args";
+const RSYNC_PROBE = `rsync ${RSYNC_FLAGS} --version >/dev/null`;
+
 // Emits "exit" as a microtask, not via setTimeout.
 //
 // setTimeout is a macrotask, so it always fires after the microtask queue has
@@ -73,16 +80,26 @@ const killMock = vi.fn();
 // the app down once (createCmd awaited a Redis write between spawn() and
 // attaching the exit handler). Resolving a promise instead makes the ordering
 // realistic: attach late and the event is missed, exactly as in production.
-const mockSpawn = (stderrMessage?: string, exitCode = 0) => {
-    spawnMocks.spawn.mockImplementation(() => {
+//
+// The rsync probe fails unless a test opts in. That is the fleet default —
+// only the server and the Linux devices have a usable rsync — and it keeps
+// every sequence assertion below aimed at the scp fallback it was written for.
+const mockSpawn = (
+    stderrMessage?: string,
+    exitCode = 0,
+    { rsync = false }: { rsync?: boolean } = {},
+) => {
+    spawnMocks.spawn.mockImplementation((_bin, args) => {
+        const cmd = (args as string[])[1];
+        const isProbe = cmd.includes("--protect-args --version");
         const emitter = new EventEmitter();
         const stdout = new EventEmitter();
         const stderr = new EventEmitter();
         void Promise.resolve().then(() => {
-            if (stderrMessage) {
+            if (stderrMessage && !isProbe) {
                 stderr.emit("data", Buffer.from(stderrMessage));
             }
-            emitter.emit("exit", exitCode);
+            emitter.emit("exit", isProbe ? (rsync ? 0 : 1) : exitCode);
         });
         return {
             stdout,
@@ -247,7 +264,8 @@ describe("sync pair ordering", () => {
 
         await backup.pullPairs(device, pairs, serverInfo);
 
-        expect(ranCommands()[0]).toBe("rm -rf /srv/emu\\ sync/work");
+        // [0] is the rsync capability probe; the workDir setup follows it.
+        expect(ranCommands()[1]).toBe("rm -rf /srv/emu\\ sync/work");
     });
 
     it("emits the exact push sequence for a linux device", async () => {
@@ -256,6 +274,7 @@ describe("sync pair ordering", () => {
         await backup.pushPairs(device, pairs);
 
         expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
             "ssh -p 22 root@10.0.0.10 'rm -rf /tmp/work'",
             "ssh -p 22 root@10.0.0.10 'mkdir /tmp/work'",
             "scp -P 22 -r /srv/a root@10.0.0.10:/tmp/work",
@@ -279,6 +298,7 @@ describe("sync pair ordering", () => {
         ]);
 
         expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
             "ssh -p 22 root@10.0.0.10 'rm -rf /tmp/emu\\ work'",
             "ssh -p 22 root@10.0.0.10 'mkdir /tmp/emu\\ work'",
             "scp -P 22 -r /srv/my\\ saves root@10.0.0.10:/tmp/emu\\ work",
@@ -294,6 +314,7 @@ describe("sync pair ordering", () => {
         await backup.pullPairs(device, pairs, serverInfo);
 
         expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
             "rm -rf /srv/work",
             "mkdir -p /srv/work",
             "scp -P 22 -r root@10.0.0.10:/srv/a /srv/work",
@@ -339,7 +360,13 @@ describe("sync pair ordering", () => {
             const stdout = new EventEmitter();
             const stderr = new EventEmitter();
             void Promise.resolve().then(() =>
-                emitter.emit("exit", cmd.includes("scp") ? 1 : 0),
+                emitter.emit(
+                    "exit",
+                    cmd.includes("scp") ||
+                        cmd.includes("--protect-args --version")
+                        ? 1
+                        : 0,
+                ),
             );
             return {
                 stdout,
@@ -358,6 +385,215 @@ describe("sync pair ordering", () => {
         );
         expect(deletes).toEqual([]);
         expect(ranCommands().some((c) => c.includes("/srv/b"))).toBe(false);
+    });
+});
+
+// rsync exists on the server and on the Linux devices, but not on the Termux
+// devices and not on the Windows box, so both paths are live in production and
+// both need coverage.
+describe("rsync transfers", () => {
+    const ranCommands = () =>
+        spawnMocks.spawn.mock.calls.map(([, args]) => (args as string[])[1]);
+    const probes = () =>
+        ranCommands().filter((c) => c.includes("--protect-args --version"));
+    // Matched through `-e`, not on the flags alone: the probe is an rsync
+    // invocation carrying the very same flags, by design.
+    const transfers = () =>
+        ranCommands().filter((c) => c.startsWith(`rsync ${RSYNC_FLAGS} -e `));
+
+    const pairs = [
+        { source: "/srv/a", target: "/device/a" },
+        { source: "/srv/b", target: "/device/b" },
+    ];
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockSpawn(undefined, 0, { rsync: true });
+    });
+
+    it("builds push and pull commands", () => {
+        const device = buildDevice();
+
+        expect(
+            backup.buildRsyncCommand(device, "/srv/a", "/device/a", true),
+        ).toBe(
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "/srv/a/ root@10.0.0.10:/device/a/",
+        );
+        expect(
+            backup.buildRsyncCommand(device, "/device/a", "/srv/a", false),
+        ).toBe(
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "root@10.0.0.10:/device/a/ /srv/a/",
+        );
+    });
+
+    it("appends exactly one trailing slash to each side", () => {
+        // Without it rsync nests the source inside the target instead of
+        // mirroring it, and --delete then wipes what is already there.
+        const device = buildDevice();
+
+        expect(
+            backup.buildRsyncCommand(device, "/srv/a/", "/device/a/", true),
+        ).toContain(" /srv/a/ root@10.0.0.10:/device/a/");
+    });
+
+    it("escapes spaces on both sides", () => {
+        const device = buildDevice();
+
+        expect(
+            backup.buildRsyncCommand(
+                device,
+                "/srv/my saves",
+                "/device/my saves",
+                true,
+            ),
+        ).toBe(
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "/srv/my\\ saves/ root@10.0.0.10:/device/my\\ saves/",
+        );
+    });
+
+    it("probes with exactly the flags the transfer uses", async () => {
+        // The literal strings above can drift; this cannot. An rsync old
+        // enough to reject one of these flags has to fail the probe and take
+        // the scp path, rather than pass it and then die mid-transfer.
+        const device = buildDevice();
+
+        await backup.pushPairs(device, pairs);
+
+        const probed = probes()[0]
+            .replace(/^rsync /, "")
+            .replace(" --version >/dev/null", "");
+        const used = transfers()[0]
+            .replace(/^rsync /, "")
+            .split(" -e ")[0];
+        expect(probed).toBe(used);
+    });
+
+    it("replaces the whole stage-delete-move sequence on push", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+
+        await backup.pushPairs(device, pairs);
+
+        expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
+            `ssh -p 22 root@10.0.0.10 '${RSYNC_PROBE}'`,
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "/srv/a/ root@10.0.0.10:/device/a/",
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "/srv/b/ root@10.0.0.10:/device/b/",
+        ]);
+    });
+
+    it("replaces the whole stage-delete-move sequence on pull", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/work" } as EmuServer;
+
+        await backup.pullPairs(device, pairs, serverInfo);
+
+        expect(ranCommands()).toEqual([
+            RSYNC_PROBE,
+            `ssh -p 22 root@10.0.0.10 '${RSYNC_PROBE}'`,
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "root@10.0.0.10:/srv/a/ /device/a/",
+            `rsync ${RSYNC_FLAGS} -e ssh\\ -p\\ 22 ` +
+                "root@10.0.0.10:/srv/b/ /device/b/",
+        ]);
+        // The server workDir is never created or deleted on this path.
+        expect(ranCommands().some((c) => c.includes("/srv/work"))).toBe(false);
+    });
+
+    it("aborts before the second pair when the first rsync fails", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+        spawnMocks.spawn.mockImplementation((_bin, args) => {
+            const cmd = (args as string[])[1];
+            const emitter = new EventEmitter();
+            const stdout = new EventEmitter();
+            const stderr = new EventEmitter();
+            void Promise.resolve().then(() =>
+                emitter.emit(
+                    "exit",
+                    cmd.startsWith(`rsync ${RSYNC_FLAGS} -e `) ? 23 : 0,
+                ),
+            );
+            return {
+                stdout,
+                stderr,
+                on: emitter.on.bind(emitter),
+                kill: killMock,
+            } as never;
+        });
+
+        await expect(backup.pushPairs(device, pairs)).rejects.toThrow(
+            /Command failed \(exit 23\)/,
+        );
+        expect(ranCommands().some((c) => c.includes("/srv/b"))).toBe(false);
+    });
+
+    it("falls back to scp when the device has no rsync", async () => {
+        // odin and thor are Termux; rsync is not in their default package set.
+        spawnMocks.spawn.mockImplementation((_bin, args) => {
+            const cmd = (args as string[])[1];
+            const remoteProbe =
+                cmd.includes("--protect-args --version") &&
+                cmd.startsWith("ssh ");
+            const emitter = new EventEmitter();
+            const stdout = new EventEmitter();
+            const stderr = new EventEmitter();
+            void Promise.resolve().then(() =>
+                emitter.emit("exit", remoteProbe ? 1 : 0),
+            );
+            return {
+                stdout,
+                stderr,
+                on: emitter.on.bind(emitter),
+                kill: killMock,
+            } as never;
+        });
+        const device = buildDevice({ os: EmuOs.android });
+
+        await backup.pushPairs(device, pairs);
+
+        expect(probes()).toHaveLength(2);
+        expect(transfers()).toEqual([]);
+        expect(ranCommands().filter((c) => c.includes("scp"))).toHaveLength(2);
+    });
+
+    it("does not ask the device when the server has no rsync", async () => {
+        mockSpawn(undefined, 0, { rsync: false });
+        const device = buildDevice();
+
+        await backup.pushPairs(device, pairs);
+
+        expect(probes()).toEqual([RSYNC_PROBE]);
+        expect(transfers()).toEqual([]);
+    });
+
+    it("never probes a windows device", async () => {
+        // haste answers ssh with PowerShell, where `command -v` is not a
+        // command and the exit status would not mean what this check reads it
+        // to mean.
+        const device = buildDevice({
+            os: EmuOs.windows,
+            workDir: "C:/tmp/work",
+        });
+
+        await backup.pushPairs(device, [
+            { source: "/srv/a", target: "D:/saves" },
+        ]);
+
+        expect(probes()).toEqual([]);
+        expect(transfers()).toEqual([]);
+    });
+
+    it("never probes an ftp device", async () => {
+        ftpMocks.access.mockRejectedValue(new Error("nope"));
+        const device = buildDevice({ syncType: SyncType.ftp, os: EmuOs.nx });
+
+        await expect(backup.pushPairs(device, pairs)).rejects.toThrow("nope");
+
+        expect(probes()).toEqual([]);
     });
 });
 
