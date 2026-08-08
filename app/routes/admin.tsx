@@ -1257,8 +1257,7 @@ export default function Admin() {
                                         label={field.label}
                                         value={
                                             (deviceForm[field.key] as
-                                                | string
-                                                | number) ?? ""
+                                                string | number) ?? ""
                                         }
                                         onChange={(e) =>
                                             handleDeviceFormChange(
