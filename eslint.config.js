@@ -17,6 +17,17 @@ export default [
     },
     js.configs.recommended,
     ...tseslint.configs.recommended,
+    react.configs.flat.recommended,
+    // Required alongside recommended: it turns off react-in-jsx-scope and
+    // jsx-uses-react, which the automatic JSX runtime makes wrong.
+    react.configs.flat["jsx-runtime"],
+    // react/prop-types stays on and stays quiet: eslint-plugin-react accepts
+    // TypeScript prop annotations as validation, so the typed components here
+    // satisfy it. `bunx eslint .` reports zero messages.
+    jsxA11y.flatConfigs.recommended,
+    // Needs to be in scope for the recommended config above, not only for the
+    // TypeScript block below, or eslint-plugin-react warns on every run.
+    { settings: { react: { version: "detect" } } },
     {
         files: ["**/*.{ts,tsx}"],
         languageOptions: {
@@ -31,9 +42,7 @@ export default [
             },
         },
         plugins: {
-            react,
             "react-hooks": reactHooks,
-            "jsx-a11y": jsxA11y,
         },
         settings: {
             react: {
@@ -48,8 +57,6 @@ export default [
                     varsIgnorePattern: "^_",
                 },
             ],
-            "react/react-in-jsx-scope": "off",
-            "react/jsx-uses-react": "off",
             "react-hooks/rules-of-hooks": "error",
             "react-hooks/exhaustive-deps": "warn",
         },

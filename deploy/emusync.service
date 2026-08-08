@@ -1,0 +1,21 @@
+# /etc/systemd/system/emusync.service
+#
+# Runs the built app from a checkout. Deploying is: git pull, bun install,
+# bun run build, systemctl restart emusync.
+[Unit]
+Description=emusync save sync server
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+User=auro
+WorkingDirectory=/home/auro/code/emusync
+Environment=DB_PATH=/opt/emusync/db.json
+Environment=REDIS_URL=redis://localhost:6379
+Environment=PATH=/home/auro/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/auro/.bun/bin/bun run start
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

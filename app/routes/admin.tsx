@@ -1404,8 +1404,9 @@ export default function Admin() {
                     </DialogTitle>
                     <DialogContent>
                         <Typography>
-                            Are you sure you want to delete "{deviceToDelete}"?
-                            This action cannot be undone.
+                            Are you sure you want to delete &quot;
+                            {deviceToDelete}&quot;? This action cannot be
+                            undone.
                         </Typography>
                     </DialogContent>
                     <DialogActions sx={{ px: 3, pb: 3 }}>

@@ -8,11 +8,33 @@ on:
 jobs:
     quality:
         runs-on: ubuntu-latest
+        services:
+            redis:
+                image: redis:7-alpine
+                ports:
+                    - 6379:6379
+                options: >-
+                    --health-cmd "redis-cli ping"
+                    --health-interval 5s
+                    --health-timeout 3s
+                    --health-retries 10
         steps:
             - uses: actions/checkout@v4
             - name: Setup Bun
               uses: oven-sh/setup-bun@v2
               with:
-                  bun-version: latest
-            - run: bun install
+                  # Pinned to the version infra runs. `latest` meant CI could
+                  # pass on a runtime production does not have.
+                  bun-version: 1.3.14
+            # --frozen-lockfile: a bare `bun install` will happily resolve a
+            # different tree than the lockfile records, so CI was not testing
+            # the dependency set anyone else installs.
+            - run: bun install --frozen-lockfile
             - run: bun run check
+            - run: bun run build
+            # `bun run check` passes on a tree that cannot boot. This starts
+            # the built server against a throwaway config and asks it for its
+            # device list.
+            - run: ./deploy/smoke.sh
+              env:
+                  REDIS_URL: redis://localhost:6379

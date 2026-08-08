@@ -1,101 +1,125 @@
-# Welcome to React Router!
+# emusync
 
-A modern, production-ready template for building full-stack React applications using React Router.
+A self-hosted server that moves emulator save files between a save store on
+the server and the devices that play the games. Push sends the server's copy
+to a device; pull brings a device's copy back. There is no merge and no
+conflict resolution — whichever direction you choose overwrites the other
+side, so the workflow is "pull when you stop playing, push before you start".
 
-[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/remix-run/react-router-templates/tree/main/default)
+There is no authentication, deliberately. The server binds every interface,
+so keeping it off the public internet is the operator's job — bind it to a
+private interface or firewall the port. Anyone who can reach it can read the
+admin page and start a sync that overwrites saves.
 
-## Features
+## How it works
 
-- 🚀 Server-side rendering
-- ⚡️ Hot Module Replacement (HMR)
-- 📦 Asset bundling and optimization
-- 🔄 Data loading and mutations
-- 🔒 TypeScript by default
-- 🎉 TailwindCSS for styling
-- 📖 [React Router docs](https://reactrouter.com/)
+`db.json` holds the whole configuration: one `server` object with a path per
+emulator, and a `devices` array with per-device paths, address and OS. The
+admin page at `/admin` edits that file; nothing else is stateful except job
+records in Redis.
 
-## Getting Started
+A sync is a list of source/target directory pairs, built per emulator by
+`app/server/emulator_managers.ts`. Each pair is transferred one at a time,
+staged through the receiving side's `workDir` — the device's on a push, the
+server's on a pull:
 
-### Prerequisites
+1. copy the source into the receiving side's `workDir`
+2. delete the target directory
+3. move the staged copy into its place
 
-- [Bun](https://bun.sh/) for install and scripts
-- Redis running locally (`redis://localhost:6379` by default)
-- `zip` and `unzip` available on `PATH` (required for Dolphin Android sync)
+Interleaved per pair, not batched — a failure part-way through leaves the
+remaining pairs untouched rather than several directories already deleted.
 
-### Installation
+Transfers use `ssh`/`scp` for everything except Nintendo Switch devices
+(`os: "nx"`), which use FTP. Dolphin on Android goes through a zip in the
+device's dump directory because the emulator's own save directory is
+app-private.
 
-Install the dependencies:
+Only one sync runs at a time. A second request gets a 409 carrying the id of
+the job that holds the slot; pulls stage through the single server `workDir`,
+so concurrent syncs would overwrite each other's staged copies.
+
+## Requirements
+
+- [Bun](https://bun.sh/) 1.3.14
+- Redis, reachable at `REDIS_URL`. `deploy/emusync.service` declares
+  `Requires=redis-server.service`, so under systemd it will not start
+  without it. Run directly, the process starts either way and it is the
+  requests that fail — initialisation is lazy
+- `zip` and `unzip` on `PATH` (Dolphin Android sync)
+- `ssh`/`scp`, and non-interactive SSH from the server to every device
+  except Nintendo Switch (`os: "nx"`), which uses FTP
+
+## Configuration
+
+| Variable    | Default                  | Purpose                         |
+| ----------- | ------------------------ | ------------------------------- |
+| `DB_PATH`   | `./db.json`              | Device and server configuration |
+| `REDIS_URL` | `redis://localhost:6379` | Job records and sync logs       |
+| `PORT`      | `3000`                   | Port for `bun run start`        |
+
+See `.env.example`. `db.json` is gitignored: it holds the real paths and
+addresses of every device.
+
+All twenty `server` paths must be set, and the nineteen save paths must
+already exist on disk: initialisation `access()`es each one and fails if any
+is missing. `workDir` is the exception — it is created and destroyed by each
+sync. Device paths are optional; an emulator is offered for a device only
+when the paths that emulator needs are filled in.
+
+A `db.json` sketch — the `server` block is abbreviated here, but in a real
+one all twenty paths must be present:
+
+```json
+{
+    "devices": [
+        {
+            "name": "herb",
+            "ip": "herb.home.arpa",
+            "port": 22,
+            "user": "auro",
+            "password": "unused",
+            "os": "linux",
+            "retroarchSave": "/home/auro/Emulation/Saves",
+            "retroarchState": "/home/auro/Emulation/States",
+            "workDir": "/home/auro/.emusync_tmp"
+        }
+    ],
+    "server": {
+        "retroarchSave": "/opt/emusync/saves/retroarch/saves",
+        "retroarchState": "/opt/emusync/saves/retroarch/states"
+    }
+}
+```
+
+`os` is one of `linux`, `windows`, `android`, `muos`, `nx`. `password` is
+unused for SSH devices (authentication is by key) but the field must be
+present; FTP devices do use it.
+
+## Development
 
 ```bash
 bun install
+bun run dev      # http://localhost:5173
+bun run health   # format, then typecheck + test + lint
 ```
 
-### Development
-
-Start the development server with HMR:
-
-```bash
-bun run dev
-```
-
-Your application will be available at `http://localhost:5173`.
-
-### Quality Checks
-
-Run the health check before any change. It formats, typechecks, runs tests, and lints:
-
-```bash
-bun run health
-```
-
-## Building for Production
-
-Create a production build:
-
-```bash
-bun run build
-```
+`bun run check` is the same as `health` without the reformat, and is what CI
+runs. CI additionally builds and runs `deploy/smoke.sh`, which boots the
+built server against a throwaway config and asks it for its device list —
+`check` passes happily on a tree that cannot start.
 
 ## Deployment
 
-### Docker Deployment
-
-To build and run using Docker:
+The fleet runs it under systemd from a checkout; see
+`deploy/emusync.service`. Deploying is:
 
 ```bash
-docker build -t my-app .
-
-# Run the container
-docker run -p 3000:3000 my-app
+git pull && bun install && bun run build && sudo systemctl restart emusync
 ```
 
-The containerized application can be deployed to any platform that supports Docker, including:
+`deploy/README.md` covers the save-store backup job, which runs separately
+on the backup host.
 
-- AWS ECS
-- Google Cloud Run
-- Azure Container Apps
-- Digital Ocean App Platform
-- Fly.io
-- Railway
-
-### DIY Deployment
-
-If you're familiar with deploying Node applications, the built-in app server is production-ready.
-
-Make sure to deploy the output of `bun run build`
-
-```
-├── package.json
-├── bun.lock
-├── build/
-│   ├── client/    # Static assets
-│   └── server/    # Server-side code
-```
-
-## Styling
-
-This template comes with [Tailwind CSS](https://tailwindcss.com/) already configured for a simple default starting experience. You can use whatever CSS framework you prefer.
-
----
-
-Built with ❤️ using React Router.
+A `Dockerfile` is included but is not how the fleet runs it, is not built in
+CI, and should be treated as unverified.

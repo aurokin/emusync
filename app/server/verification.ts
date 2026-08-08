@@ -151,6 +151,9 @@ export const verifyServer = (server: unknown): EmuServer | null => {
 
 export const serverHasFolders = async (server: EmuServer) => {
     try {
+        // workDir is deliberately absent from this list: every sync deletes
+        // and recreates it, so requiring it to pre-exist would fail a
+        // perfectly good config on first boot.
         const paths = [
             server.cemuSave,
             server.azahar,

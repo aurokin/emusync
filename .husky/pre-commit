@@ -1,3 +1,14 @@
 #!/usr/bin/env sh
-bun run format
-git add .
+# Format only the files being committed. `git add .` swept every unrelated
+# working-tree change into the commit.
+#
+# The list goes through a file, not a variable: command substitution strips
+# the NUL separators from `git diff -z`, which would concatenate every staged
+# path into one argument.
+set -e
+staged=$(mktemp)
+trap 'rm -f "$staged"' EXIT
+git diff --cached --name-only --diff-filter=ACMR -z > "$staged"
+[ -s "$staged" ] || exit 0
+xargs -0 bunx prettier --ignore-unknown --write -- < "$staged"
+xargs -0 git add -- < "$staged"
