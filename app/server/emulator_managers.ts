@@ -156,19 +156,19 @@ const managePcsx2 = (
     push: boolean,
 ): SyncPair[] => {
     if (!device.pcsx2Save) return [];
-    const serverPairs: SyncPair[] = [];
-    if (push) {
-        serverPairs.push({
-            source: serverInfo.nethersx2Save,
-            target: device.pcsx2Save,
-        });
-    } else {
-        serverPairs.push({
-            source: device.pcsx2Save,
-            target: serverInfo.nethersx2Save,
-        });
-    }
-    return serverPairs;
+    // PCSX2 and NetherSX2 share one server field, so they must resolve it to
+    // the same depth. Using it raw here pointed pcsx2 at the parent of the
+    // memcards directory that nethersx2 syncs, so a pcsx2 pull would delete
+    // the whole NetherSX2 tree and leave the cards one level too high.
+    const serverMemcardsPath = getNetherSX2MemcardsPath(
+        serverInfo.nethersx2Save,
+    );
+    return [
+        {
+            source: push ? serverMemcardsPath : device.pcsx2Save,
+            target: push ? device.pcsx2Save : serverMemcardsPath,
+        },
+    ];
 };
 
 const managePpsspp = (

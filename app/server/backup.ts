@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import fs from "node:fs/promises";
 import type { EmuDevice, SyncPair, EmuServer, DeviceSyncRecord } from "./types";
 import { SyncType, EmuOs } from "./types";
 import { Client as FtpClient } from "basic-ftp";
@@ -32,26 +33,30 @@ const appendJobLog = async (jobId: string | undefined, line: string) => {
     }
 };
 
-export const createCmd = async (
-    cmd: string,
-    isSftp: boolean = false,
-    jobId?: string,
-) => {
+// Success is the exit code and nothing else. ssh and scp write routine
+// notices to stderr ("Warning: Permanently added ... to the list of known
+// hosts"), so treating stderr as failure aborted healthy syncs; conversely a
+// silent non-zero exit used to resolve as success and let the caller go on to
+// delete the target directory. stderr is buffered purely for the error message.
+export const createCmd = async (cmd: string, jobId?: string) => {
     const p = spawn("bash", ["-c", cmd]);
-    let failed = false;
     let settled = false;
+    const stderrChunks: string[] = [];
     console.log(`?: ${cmd}`);
 
     // Attach all handlers synchronously: a fast command can exit before any
     // await completes, and an unobserved exit event would hang the job.
-    const done = new Promise((resolve, reject) => {
-        const rejectOnce = (err: unknown) => {
+    const done = new Promise<number>((resolve, reject) => {
+        const rejectOnce = (err: Error) => {
             if (settled) return;
             settled = true;
+            // Don't leave a half-finished scp writing into a workDir the next
+            // step is about to delete.
+            p.kill();
             reject(err);
         };
 
-        const resolveOnce = (value: unknown) => {
+        const resolveOnce = (value: number) => {
             if (settled) return;
             settled = true;
             resolve(value);
@@ -59,43 +64,37 @@ export const createCmd = async (
 
         p.stdout.on("data", (x) => {
             const msg = x.toString();
-            // process.stdout.write(`STDOUT: ${msg}`);
             void appendJobLog(jobId, `STDOUT: ${msg.trimEnd()}`);
         });
 
         p.stderr.on("data", (buf) => {
             const msg = buf.toString();
-            const shouldFail = !isSftp || msg.includes("Connection closed");
-            if (shouldFail) {
-                failed = true;
-            }
-
-            // process.stderr.write(`STDERR: ${msg}`);
+            stderrChunks.push(msg);
             void appendJobLog(jobId, `STDERR: ${msg.trimEnd()}`);
-
-            if (shouldFail) {
-                rejectOnce(new Error("Failure in command"));
-            }
         });
 
-        p.on("exit", (code) => {
-            const exitCode = code ?? 0;
-            if (failed) {
-                console.error(`N: ${cmd}\n`);
-                void appendJobLog(
-                    jobId,
-                    `EXIT: ${code ?? "unknown"} (failure)`,
-                );
-                rejectOnce(exitCode);
-            } else if (exitCode === 0) {
+        p.on("error", (err) => {
+            console.error(`N: ${cmd}\n`);
+            void appendJobLog(jobId, `ERROR: ${err.message}`);
+            rejectOnce(err);
+        });
+
+        p.on("exit", (code, signal) => {
+            if (code === 0) {
                 console.log(`Y: ${cmd}\n`);
-                void appendJobLog(jobId, `EXIT: ${exitCode} (ok)`);
-                resolveOnce(exitCode);
-            } else {
-                console.log(`~: ${cmd}\n`);
-                void appendJobLog(jobId, `EXIT: ${exitCode} (non-zero)`);
-                resolveOnce(exitCode);
+                void appendJobLog(jobId, `EXIT: 0 (ok)`);
+                resolveOnce(0);
+                return;
             }
+            const detail = code === null ? `signal ${signal}` : `exit ${code}`;
+            const stderr = stderrChunks.join("").trim();
+            console.error(`N: ${cmd}\n`);
+            void appendJobLog(jobId, `EXIT: ${code ?? signal} (failure)`);
+            rejectOnce(
+                new Error(
+                    `Command failed (${detail}): ${cmd}${stderr ? `\n${stderr}` : ""}`,
+                ),
+            );
         });
     });
 
@@ -152,6 +151,12 @@ export const connectionTest = async (device: EmuDevice) => {
     }
 };
 
+const runCommands = async (commands: string[], jobId?: string) => {
+    for (const cmd of commands) {
+        await createCmd(cmd, jobId);
+    }
+};
+
 export const pushPairs = async (
     device: EmuDevice,
     serverPairs: SyncPair[],
@@ -176,7 +181,12 @@ export const pushPairs = async (
                 await client.rename(device.workDir, target);
             }
         } catch (e) {
+            const message = (e as Error)?.message ?? String(e);
             console.error(e);
+            await appendJobLog(jobId, `FTP ERROR: ${message}`);
+            // Rethrow: swallowing this reported a half-completed device swap
+            // as a successful sync.
+            throw e;
         } finally {
             client.close();
         }
@@ -189,38 +199,20 @@ export const pushPairs = async (
             ),
             buildSshCommand(device, `mkdir ${device.workDir}`),
         ];
-        const copyToDeviceCmds: string[] = [];
-        const deleteOldSavesOnDeviceCmds: string[] = [];
-        const moveNewSavesOnDeviceCmds: string[] = [];
+        // Stage, delete and move one pair at a time. Batching every delete
+        // ahead of every move meant one failed move left several target
+        // directories already deleted, with the only copies sitting in the
+        // workDir that the next run wipes first.
+        const perPairCmds = serverPairs.flatMap(({ source, target }) => [
+            buildScpCommand(device, source, device.workDir, true),
+            buildSshCommand(device, buildRm(esc(target, isWindows), isWindows)),
+            buildSshCommand(
+                device,
+                `mv ${device.workDir}/${getFolderName(source)} ${esc(target, isWindows)}`,
+            ),
+        ]);
 
-        serverPairs.forEach(({ source, target }) => {
-            copyToDeviceCmds.push(
-                buildScpCommand(device, source, device.workDir, true),
-            );
-            deleteOldSavesOnDeviceCmds.push(
-                buildSshCommand(
-                    device,
-                    buildRm(esc(target, isWindows), isWindows),
-                ),
-            );
-            moveNewSavesOnDeviceCmds.push(
-                buildSshCommand(
-                    device,
-                    `mv ${device.workDir}/${getFolderName(source)} ${esc(target, isWindows)}`,
-                ),
-            );
-        });
-
-        const commands = [
-            ...setupCmds,
-            ...copyToDeviceCmds,
-            ...deleteOldSavesOnDeviceCmds,
-            ...moveNewSavesOnDeviceCmds,
-        ];
-
-        for (const cmd of commands) {
-            await createCmd(cmd, false, jobId);
-        }
+        await runCommands([...setupCmds, ...perPairCmds], jobId);
     }
 };
 
@@ -241,62 +233,48 @@ export const pullPairs = async (
                 password: device.password,
                 secure: false,
             });
-            const setupCmds = [
-                `rm -rf ${serverInfo.workDir}`,
-                `mkdir ${serverInfo.workDir}`,
-            ];
-            for (const cmd of setupCmds) {
-                await createCmd(cmd, false, jobId);
-            }
+            const workDir = esc(serverInfo.workDir);
             for (const { source, target } of serverPairs) {
-                await client.ensureDir(source);
+                // The move below consumes workDir, so re-create it per pair.
+                await createCmd(`rm -rf ${workDir}`, jobId);
+                await createCmd(`mkdir -p ${workDir}`, jobId);
+                // cd, not ensureDir: ensureDir CREATES a missing remote
+                // directory, so a stale source path used to yield an empty
+                // download that then replaced the canonical store.
+                await client.cd(source);
                 await client.downloadToDir(serverInfo.workDir);
-                await createCmd(`rm -rf ${target}`, false, jobId);
-                await createCmd(
-                    `mv ${serverInfo.workDir} ${target}`,
-                    false,
-                    jobId,
-                );
+                const downloaded = await fs.readdir(serverInfo.workDir);
+                if (downloaded.length === 0) {
+                    throw new Error(
+                        `Refusing to replace ${target}: downloaded nothing from ${source}`,
+                    );
+                }
+                await createCmd(`rm -rf ${esc(target)}`, jobId);
+                await createCmd(`mv ${workDir} ${esc(target)}`, jobId);
             }
         } catch (e) {
+            const message = (e as Error)?.message ?? String(e);
             console.error(e);
+            await appendJobLog(jobId, `FTP ERROR: ${message}`);
+            // Rethrow: swallowing this reported a failed pull as a success.
+            throw e;
         } finally {
             client.close();
         }
     } else {
         const isWindows = device.os === EmuOs.windows;
-        const setupCmds = [
-            `rm -rf ${serverInfo.workDir}`,
-            `mkdir ${serverInfo.workDir}`,
-        ];
-        const copyToServerCmds: string[] = [];
-        const deleteOldSavesOnServerCmds: string[] = [];
-        const moveNewSavesOnServerCmds: string[] = [];
+        // workDir is escaped here too: it reaches an rm -rf, and leaving it
+        // bare made a path containing a space delete the wrong directory.
+        const workDir = esc(serverInfo.workDir);
+        const setupCmds = [`rm -rf ${workDir}`, `mkdir -p ${workDir}`];
 
-        serverPairs.forEach(({ source, target }) => {
-            copyToServerCmds.push(
-                buildScpCommand(
-                    device,
-                    esc(source, isWindows),
-                    serverInfo.workDir,
-                    false,
-                ),
-            );
-            deleteOldSavesOnServerCmds.push(`rm -rf ${esc(target)}`);
-            moveNewSavesOnServerCmds.push(
-                `mv ${serverInfo.workDir}/${getFolderName(source)} ${esc(target)}`,
-            );
-        });
+        // One pair at a time — see the note in pushPairs.
+        const perPairCmds = serverPairs.flatMap(({ source, target }) => [
+            buildScpCommand(device, esc(source, isWindows), workDir, false),
+            `rm -rf ${esc(target)}`,
+            `mv ${workDir}/${getFolderName(source)} ${esc(target)}`,
+        ]);
 
-        const commands = [
-            ...setupCmds,
-            ...copyToServerCmds,
-            ...deleteOldSavesOnServerCmds,
-            ...moveNewSavesOnServerCmds,
-        ];
-
-        for (const cmd of commands) {
-            await createCmd(cmd, false, jobId);
-        }
+        await runCommands([...setupCmds, ...perPairCmds], jobId);
     }
 };

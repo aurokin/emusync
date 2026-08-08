@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { EmuDevice } from "./types";
+import type { EmuDevice, EmuServer } from "./types";
 import { EmuOs, SyncType } from "./types";
 import * as backup from "./backup";
 
@@ -63,7 +63,9 @@ const buildDevice = (overrides: Partial<EmuDevice> = {}): EmuDevice => ({
     ...overrides,
 });
 
-const mockSpawn = (stderrMessage?: string) => {
+const killMock = vi.fn();
+
+const mockSpawn = (stderrMessage?: string, exitCode = 0) => {
     spawnMocks.spawn.mockImplementation(() => {
         const emitter = new EventEmitter();
         const stdout = new EventEmitter();
@@ -73,15 +75,17 @@ const mockSpawn = (stderrMessage?: string) => {
                 stderr.emit("data", Buffer.from(stderrMessage));
             }, 0);
         }
-        setTimeout(() => emitter.emit("exit", 0), 0);
+        setTimeout(() => emitter.emit("exit", exitCode), 0);
         return {
             stdout,
             stderr,
             on: emitter.on.bind(emitter),
+            kill: killMock,
         } as unknown as {
             stdout: EventEmitter;
             stderr: EventEmitter;
             on: (event: string, cb: (...args: unknown[]) => void) => void;
+            kill: () => void;
         };
     });
 };
@@ -145,11 +149,96 @@ describe("backup helpers", () => {
     });
 
     it("returns false when ssh test fails", async () => {
-        mockSpawn("ssh-error");
+        mockSpawn("ssh-error", 255);
         const device = buildDevice({ syncType: SyncType.ssh });
 
         const result = await backup.connectionTest(device);
 
         expect(result).toBe(false);
+    });
+
+    it("treats a zero exit as success even when the command wrote to stderr", async () => {
+        // ssh writes "Warning: Permanently added ... to the list of known
+        // hosts" to stderr on a first connection. Failing on that aborted
+        // healthy syncs partway through.
+        mockSpawn(
+            "Warning: Permanently added 'host' to the list of known hosts.",
+            0,
+        );
+        const device = buildDevice({ syncType: SyncType.ssh });
+
+        await expect(backup.connectionTest(device)).resolves.toBe(true);
+    });
+
+    it("rejects on a non-zero exit that printed nothing", async () => {
+        mockSpawn(undefined, 3);
+
+        await expect(backup.createCmd("false")).rejects.toThrow(
+            /Command failed \(exit 3\)/,
+        );
+    });
+});
+
+// Batching every target deletion ahead of every move meant one failed move
+// left several target directories already deleted, with the only copies in a
+// workDir the next run wipes first. Each pair must be staged, deleted and
+// moved before the next pair is touched.
+describe("sync pair ordering", () => {
+    const ranCommands = () =>
+        spawnMocks.spawn.mock.calls.map(([, args]) => (args as string[])[1]);
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockSpawn();
+    });
+
+    const pairs = [
+        { source: "/srv/a", target: "/device/a" },
+        { source: "/srv/b", target: "/device/b" },
+    ];
+
+    it("finishes each pair before staging the next on push", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+
+        await backup.pushPairs(device, pairs);
+
+        const commands = ranCommands();
+        const firstMove = commands.findIndex((c) => c.includes("/device/a"));
+        const secondScp = commands.findIndex((c) => c.includes("/srv/b"));
+        const secondDelete = commands.findIndex(
+            (c) => c.includes("rm -rf") && c.includes("/device/b"),
+        );
+
+        expect(firstMove).toBeGreaterThan(-1);
+        expect(secondScp).toBeGreaterThan(firstMove);
+        expect(secondDelete).toBeGreaterThan(secondScp);
+    });
+
+    it("finishes each pair before staging the next on pull", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/work" } as EmuServer;
+
+        await backup.pullPairs(device, pairs, serverInfo);
+
+        const commands = ranCommands();
+        const firstDelete = commands.findIndex(
+            (c) => c.startsWith("rm -rf") && c.includes("/device/a"),
+        );
+        const secondScp = commands.findIndex((c) => c.includes("scp"));
+        const lastScp = commands
+            .map((c) => c.includes("scp"))
+            .lastIndexOf(true);
+
+        expect(firstDelete).toBeGreaterThan(secondScp);
+        expect(lastScp).toBeGreaterThan(firstDelete);
+    });
+
+    it("escapes a workDir containing a space before it reaches rm -rf", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/emu sync/work" } as EmuServer;
+
+        await backup.pullPairs(device, pairs, serverInfo);
+
+        expect(ranCommands()[0]).toBe("rm -rf /srv/emu\\ sync/work");
     });
 });

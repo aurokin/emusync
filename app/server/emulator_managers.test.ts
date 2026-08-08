@@ -198,16 +198,31 @@ describe("emulator managers", () => {
         ]);
     });
 
-    it("maps pcsx2 with server nethersx2 path", () => {
+    it("maps pcsx2 to the same memcards dir nethersx2 uses", () => {
+        // Both emulators read the one nethersx2Save server field, so they must
+        // resolve it to the same depth or a pcsx2 pull deletes the tree that
+        // nethersx2 syncs.
         const device = buildDevice({ pcsx2Save: "/device/pcsx2" });
         const serverInfo = buildServer({ nethersx2Save: "/srv/pcsx2" });
-        const manage = getManageFn(Emulator.pcsx2);
 
-        expect(manage(device, serverInfo, true)).toEqual([
-            {
-                source: serverInfo.nethersx2Save,
-                target: device.pcsx2Save,
-            },
+        expect(getManageFn(Emulator.pcsx2)(device, serverInfo, true)).toEqual([
+            { source: "/srv/pcsx2/memcards", target: "/device/pcsx2" },
         ]);
+        expect(getManageFn(Emulator.pcsx2)(device, serverInfo, false)).toEqual([
+            { source: "/device/pcsx2", target: "/srv/pcsx2/memcards" },
+        ]);
+
+        const nethersx2Device = buildDevice({ nethersx2Save: "/device/nsx2" });
+        expect(
+            getManageFn(Emulator.nethersx2)(nethersx2Device, serverInfo, true)
+                .length,
+        ).toBe(1);
+        expect(
+            getManageFn(Emulator.nethersx2)(
+                nethersx2Device,
+                serverInfo,
+                true,
+            )[0].source,
+        ).toBe("/srv/pcsx2/memcards");
     });
 });

@@ -295,6 +295,15 @@ describe("dolphin android pull", () => {
         expect(commands).toContain(
             `mv "${nestedRoot}/Wii" "${serverInfo.dolphinWii}"`,
         );
+
+        // GC must be fully swapped before Wii is deleted: deleting both up
+        // front let a failed GC move strand the Wii replacement in extractDir,
+        // which the cleanup in the finally then removes.
+        expect(
+            commands.indexOf(`rm -rf "${serverInfo.dolphinWii}"`),
+        ).toBeGreaterThan(
+            commands.indexOf(`mv "${nestedRoot}/GC" "${serverInfo.dolphinGC}"`),
+        );
     });
 
     it("reads GC/Wii from deeply nested dolphin root", async () => {
@@ -409,13 +418,18 @@ describe("runDeviceSync", () => {
                 { emulator: Emulator.dolphin, action: SyncAction.ignore },
             ],
         };
-        const logs = await actions.runDeviceSync(request, device, serverInfo);
+        const { logs, failures } = await actions.runDeviceSync(
+            request,
+            device,
+            serverInfo,
+        );
 
         expect(logs).toEqual([
             `push:${Emulator.cemu}`,
             `pull:${Emulator.azahar}`,
             `ignore:${Emulator.dolphin}`,
         ]);
+        expect(failures).toEqual([]);
         expect(backupMocks.pushPairs).toHaveBeenCalledWith(
             device,
             expect.any(Array),
@@ -440,11 +454,40 @@ describe("runDeviceSync", () => {
         };
         backupMocks.pushPairs.mockRejectedValue(new Error("boom"));
 
-        const logs = await actions.runDeviceSync(request, device, serverInfo);
+        const { logs, failures } = await actions.runDeviceSync(
+            request,
+            device,
+            serverInfo,
+        );
 
         expect(logs).toEqual([
             `push:${Emulator.cemu}`,
             `error:${Emulator.cemu}:boom`,
         ]);
+        // The caller keys the job status off this; an empty array here is what
+        // used to report a fully failed sync as COMPLETE.
+        expect(failures).toEqual([Emulator.cemu]);
+    });
+
+    it("reports failures while still running the remaining emulators", async () => {
+        const device = buildDevice();
+        const serverInfo = buildServer();
+        const request = {
+            deviceName: device.name,
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+                { emulator: Emulator.azahar, action: SyncAction.pull },
+            ],
+        };
+        backupMocks.pushPairs.mockRejectedValue(new Error("boom"));
+
+        const { failures } = await actions.runDeviceSync(
+            request,
+            device,
+            serverInfo,
+        );
+
+        expect(failures).toEqual([Emulator.cemu]);
+        expect(backupMocks.pullPairs).toHaveBeenCalled();
     });
 });

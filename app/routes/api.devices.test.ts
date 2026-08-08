@@ -15,7 +15,7 @@ describe("api.devices loader", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         initializeServerMock.mockResolvedValue(undefined);
-        getSimpleDevicesMock.mockReturnValue([
+        getSimpleDevicesMock.mockResolvedValue([
             { name: "Alpha", os: EmuOs.linux, emulatorsEnabled: [] },
         ]);
     });

@@ -2,15 +2,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EmuDevice, EmuServer } from "~/server/types";
 import { Emulator, SyncAction, SyncStatus } from "~/server/types";
 import { action } from "./api.device-sync";
-import { initializeServer, getEmuDevices, getEmuServer } from "~/server";
+import { initializeServer, getServerState } from "~/server";
 import { connectionTest } from "~/server/backup";
 import { runDeviceSync } from "~/server/actions";
 import { getJSON, setJSON } from "~/server/redis";
+import {
+    tryAcquireSyncSlot,
+    releaseSyncSlot,
+    currentSyncJobId,
+} from "~/server/sync_lock";
 
 vi.mock("~/server", () => ({
     initializeServer: vi.fn(),
-    getEmuDevices: vi.fn(),
-    getEmuServer: vi.fn(),
+    getServerState: vi.fn(),
 }));
 
 vi.mock("~/server/backup", () => ({
@@ -24,6 +28,12 @@ vi.mock("~/server/actions", () => ({
 vi.mock("~/server/redis", () => ({
     setJSON: vi.fn(),
     getJSON: vi.fn(),
+}));
+
+vi.mock("~/server/sync_lock", () => ({
+    tryAcquireSyncSlot: vi.fn(),
+    releaseSyncSlot: vi.fn(),
+    currentSyncJobId: vi.fn(),
 }));
 
 const randomUUIDMock = vi.hoisted(() => vi.fn(() => "job-1"));
@@ -46,26 +56,43 @@ const callAction = (body: unknown) =>
     action({ request: buildRequest(body) } as Parameters<typeof action>[0]);
 
 const device = { name: "Alpha" } as EmuDevice;
-const serverInfo = { workDir: "/srv/work" } as EmuServer;
+const defaultServerInfo = { workDir: "/srv/work" } as EmuServer;
 
 const initializeServerMock = vi.mocked(initializeServer);
-const getEmuDevicesMock = vi.mocked(getEmuDevices);
-const getEmuServerMock = vi.mocked(getEmuServer);
+const getServerStateMock = vi.mocked(getServerState);
+const mockServerState = (
+    devices: EmuDevice[] = [device],
+    serverInfo: EmuServer | null = defaultServerInfo,
+) => getServerStateMock.mockResolvedValue({ devices, serverInfo });
 const connectionTestMock = vi.mocked(connectionTest);
 const runDeviceSyncMock = vi.mocked(runDeviceSync);
 const setJSONMock = vi.mocked(setJSON);
 const getJSONMock = vi.mocked(getJSON);
+const tryAcquireSyncSlotMock = vi.mocked(tryAcquireSyncSlot);
+const releaseSyncSlotMock = vi.mocked(releaseSyncSlot);
+const currentSyncJobIdMock = vi.mocked(currentSyncJobId);
+
+// The job runs in a detached async IIFE, so the terminal setJSON lands after
+// the action resolves.
+const flushSyncJob = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+const lastRecord = () =>
+    setJSONMock.mock.calls[setJSONMock.mock.calls.length - 1][1] as {
+        status: SyncStatus;
+        output: string[];
+    };
 
 describe("api.device-sync action", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         initializeServerMock.mockResolvedValue(undefined);
-        getEmuDevicesMock.mockReturnValue([device]);
-        getEmuServerMock.mockReturnValue(serverInfo);
+        mockServerState();
         connectionTestMock.mockResolvedValue(true);
-        runDeviceSyncMock.mockResolvedValue([]);
+        runDeviceSyncMock.mockResolvedValue({ logs: [], failures: [] });
         setJSONMock.mockResolvedValue(undefined);
         getJSONMock.mockResolvedValue(null);
+        tryAcquireSyncSlotMock.mockReturnValue(true);
+        currentSyncJobIdMock.mockReturnValue(null);
     });
 
     it("rejects missing deviceName", async () => {
@@ -119,7 +146,7 @@ describe("api.device-sync action", () => {
     });
 
     it("returns 404 for missing device", async () => {
-        getEmuDevicesMock.mockReturnValue([]);
+        mockServerState([]);
 
         const response = await callAction({
             deviceName: "Missing",
@@ -151,7 +178,7 @@ describe("api.device-sync action", () => {
     });
 
     it("returns 500 when server info missing", async () => {
-        getEmuServerMock.mockReturnValue(null);
+        mockServerState([device], null);
 
         const response = await callAction({
             deviceName: "Alpha",
@@ -176,5 +203,106 @@ describe("api.device-sync action", () => {
         const body = await response.json();
         expect(body.deviceSyncRecord.status).toBe(SyncStatus.IN_PROGRESS);
         expect(setJSONMock).toHaveBeenCalled();
+    });
+
+    it("records FAILED when any emulator failed", async () => {
+        // The whole point: a sync whose transfers all threw used to be stored
+        // COMPLETE, because runDeviceSync returned normally.
+        runDeviceSyncMock.mockResolvedValue({
+            logs: [`push:${Emulator.cemu}`, `error:${Emulator.cemu}:boom`],
+            failures: [Emulator.cemu],
+        });
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        const record = lastRecord();
+        expect(record.status).toBe(SyncStatus.FAILED);
+        expect(record.output).toContain(`FAILED: ${Emulator.cemu}`);
+    });
+
+    it("records COMPLETE when nothing failed", async () => {
+        runDeviceSyncMock.mockResolvedValue({
+            logs: [`push:${Emulator.cemu}`],
+            failures: [],
+        });
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(lastRecord().status).toBe(SyncStatus.COMPLETE);
+    });
+
+    it("returns 409 instead of starting a second concurrent sync", async () => {
+        // Two jobs would share the one server workDir, which each pull deletes
+        // as its first command.
+        tryAcquireSyncSlotMock.mockReturnValue(false);
+        currentSyncJobIdMock.mockReturnValue("job-in-flight");
+
+        const response = await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+
+        expect(response.status).toBe(409);
+        const body = await response.json();
+        expect(body.inFlightJobId).toBe("job-in-flight");
+        expect(runDeviceSyncMock).not.toHaveBeenCalled();
+    });
+
+    it("releases the sync slot after the job finishes", async () => {
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(releaseSyncSlotMock).toHaveBeenCalledWith("job-1");
+    });
+
+    it("releases the sync slot when the job record cannot be written", async () => {
+        // Otherwise the lock is held with no job running behind it, and every
+        // later sync 409s until the lease expires.
+        setJSONMock.mockRejectedValueOnce(new Error("redis down"));
+
+        const response = await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+
+        expect(response.status).toBe(500);
+        expect(releaseSyncSlotMock).toHaveBeenCalledWith("job-1");
+        expect(runDeviceSyncMock).not.toHaveBeenCalled();
+    });
+
+    it("releases the sync slot when the job throws", async () => {
+        runDeviceSyncMock.mockRejectedValue(new Error("boom"));
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(lastRecord().status).toBe(SyncStatus.FAILED);
+        expect(releaseSyncSlotMock).toHaveBeenCalledWith("job-1");
     });
 });

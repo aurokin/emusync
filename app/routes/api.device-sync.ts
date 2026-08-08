@@ -6,10 +6,15 @@ import type {
     EmulatorActionEntry,
 } from "~/server/types";
 import { Emulator, SyncAction, SyncStatus } from "~/server/types";
-import { initializeServer, getEmuDevices, getEmuServer } from "~/server";
+import { initializeServer, getServerState } from "~/server";
 import { connectionTest } from "~/server/backup";
 import { runDeviceSync } from "~/server/actions";
 import { setJSON, getJSON } from "~/server/redis";
+import {
+    tryAcquireSyncSlot,
+    releaseSyncSlot,
+    currentSyncJobId,
+} from "~/server/sync_lock";
 
 interface DeviceSyncRequestBody {
     deviceName: string;
@@ -65,8 +70,10 @@ export async function action({ request }: ActionFunctionArgs) {
         }
     }
 
-    // Find device by name
-    const emuDevices = getEmuDevices();
+    // One config snapshot for the whole request: reading devices and server
+    // paths separately could straddle an admin edit and mix two versions.
+    const { devices: emuDevices, serverInfo: emuServer } =
+        await getServerState();
     const device = emuDevices.find((d) => d.name === body.deviceName);
     if (!device) {
         return Response.json(
@@ -106,8 +113,6 @@ export async function action({ request }: ActionFunctionArgs) {
         output: [],
     };
 
-    // Ensure server info is available
-    const emuServer = getEmuServer();
     if (!emuServer) {
         return Response.json(
             { error: "Server info not initialized" },
@@ -115,13 +120,38 @@ export async function action({ request }: ActionFunctionArgs) {
         );
     }
 
-    // Store the record in Redis keyed by the job id
-    await setJSON(id, inProgressRecord);
+    // Only one sync at a time: every pull stages through emuServer.workDir and
+    // deletes it first, so a second job would pull the staging dir out from
+    // under the first, between its target deletion and its move.
+    const inFlightJobId = currentSyncJobId();
+    if (!tryAcquireSyncSlot(id)) {
+        return Response.json(
+            {
+                error: "A sync is already running. Wait for it to finish.",
+                inFlightJobId,
+            },
+            { status: 409 },
+        );
+    }
+
+    // Store the record in Redis keyed by the job id. If this fails the job
+    // never starts, so release the slot here rather than leaving syncing
+    // wedged behind a job that does not exist.
+    try {
+        await setJSON(id, inProgressRecord);
+    } catch (err) {
+        releaseSyncSlot(id);
+        console.error("Failed to create sync job record:", err);
+        return Response.json(
+            { error: "Failed to create sync job" },
+            { status: 500 },
+        );
+    }
 
     // Kick off the sync job asynchronously; update Redis on completion
     (async () => {
         try {
-            const logs = await runDeviceSync(
+            const { logs, failures } = await runDeviceSync(
                 inProgressRecord.deviceSyncRequest,
                 device,
                 emuServer,
@@ -129,12 +159,21 @@ export async function action({ request }: ActionFunctionArgs) {
             );
             const existing =
                 (await getJSON<DeviceSyncRecord>(id)) ?? inProgressRecord;
-            const completeRecord: DeviceSyncRecord = {
+            const finishedRecord: DeviceSyncRecord = {
                 ...existing,
-                status: SyncStatus.COMPLETE,
-                output: [...(existing.output ?? []), ...logs],
+                status:
+                    failures.length > 0
+                        ? SyncStatus.FAILED
+                        : SyncStatus.COMPLETE,
+                output: [
+                    ...(existing.output ?? []),
+                    ...logs,
+                    ...(failures.length > 0
+                        ? [`FAILED: ${failures.join(", ")}`]
+                        : []),
+                ],
             };
-            await setJSON(id, completeRecord);
+            await setJSON(id, finishedRecord);
         } catch (err) {
             const existing =
                 (await getJSON<DeviceSyncRecord>(id)) ?? inProgressRecord;
@@ -147,6 +186,8 @@ export async function action({ request }: ActionFunctionArgs) {
                 ],
             };
             await setJSON(id, failed);
+        } finally {
+            releaseSyncSlot(id);
         }
     })().catch((e) => console.error("Sync job error:", e));
 
