@@ -115,12 +115,18 @@ export enum SyncStatus {
     COMPLETE = "COMPLETE",
 }
 
-// Represents a sync job/response stored in Redis
+// The wire shape: what the API hands back, log lines included.
 export type DeviceSyncRecord = {
     deviceSyncRequest: DeviceSyncRequest;
     status: SyncStatus;
     output: string[];
 };
+
+// The storage shape. `output` is deliberately absent: it lives in a Redis LIST
+// at `<id>:log` so appends are atomic, and is stitched back on read. Omit
+// rather than optional, so a writer cannot accidentally persist a stale copy
+// of the log alongside the authoritative one.
+export type StoredSyncRecord = Omit<DeviceSyncRecord, "output">;
 
 export type DeviceSyncResponse = {
     id: string;

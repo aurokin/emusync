@@ -4,17 +4,28 @@ import type {
     DeviceSyncRecord,
     DeviceSyncResponse,
     EmulatorActionEntry,
+    StoredSyncRecord,
 } from "~/server/types";
 import { Emulator, SyncAction, SyncStatus } from "~/server/types";
 import { initializeServer, getServerState } from "~/server";
 import { connectionTest } from "~/server/backup";
 import { runDeviceSync } from "~/server/actions";
-import { setJSON, getJSON } from "~/server/redis";
+import { setSyncRecord, getJSON, appendLog } from "~/server/redis";
 import {
     tryAcquireSyncSlot,
     releaseSyncSlot,
     currentSyncJobId,
 } from "~/server/sync_lock";
+
+// The job status is the thing that matters; losing a log line to a Redis blip
+// must never change it, nor stop it from being written.
+const logQuietly = async (id: string, ...lines: string[]) => {
+    try {
+        await appendLog(id, ...lines);
+    } catch (e) {
+        console.error("Failed to append sync log lines:", e);
+    }
+};
 
 interface DeviceSyncRequestBody {
     deviceName: string;
@@ -112,6 +123,13 @@ export async function action({ request }: ActionFunctionArgs) {
         status: SyncStatus.IN_PROGRESS,
         output: [],
     };
+    // Stored without `output`: the log lives in a Redis LIST under `<id>:log`
+    // and is stitched back on read. Keeping it in the record meant every
+    // append was a read-modify-write that dropped concurrent lines.
+    const storedRecord: StoredSyncRecord = {
+        deviceSyncRequest: inProgressRecord.deviceSyncRequest,
+        status: inProgressRecord.status,
+    };
 
     if (!emuServer) {
         return Response.json(
@@ -138,7 +156,7 @@ export async function action({ request }: ActionFunctionArgs) {
     // never starts, so release the slot here rather than leaving syncing
     // wedged behind a job that does not exist.
     try {
-        await setJSON(id, inProgressRecord);
+        await setSyncRecord(id, storedRecord);
     } catch (err) {
         releaseSyncSlot(id);
         console.error("Failed to create sync job record:", err);
@@ -157,35 +175,36 @@ export async function action({ request }: ActionFunctionArgs) {
                 emuServer,
                 { jobId: id },
             );
+            // Isolated: a transient Redis error while writing log lines must
+            // not fall through to the catch below and record a sync that
+            // actually succeeded as FAILED.
+            await logQuietly(
+                id,
+                ...logs,
+                ...(failures.length > 0
+                    ? [`FAILED: ${failures.join(", ")}`]
+                    : []),
+            );
             const existing =
-                (await getJSON<DeviceSyncRecord>(id)) ?? inProgressRecord;
-            const finishedRecord: DeviceSyncRecord = {
+                (await getJSON<StoredSyncRecord>(id)) ?? storedRecord;
+            await setSyncRecord(id, {
                 ...existing,
                 status:
                     failures.length > 0
                         ? SyncStatus.FAILED
                         : SyncStatus.COMPLETE,
-                output: [
-                    ...(existing.output ?? []),
-                    ...logs,
-                    ...(failures.length > 0
-                        ? [`FAILED: ${failures.join(", ")}`]
-                        : []),
-                ],
-            };
-            await setJSON(id, finishedRecord);
+            });
         } catch (err) {
+            await logQuietly(
+                id,
+                `error:${(err as Error)?.message ?? String(err)}`,
+            );
             const existing =
-                (await getJSON<DeviceSyncRecord>(id)) ?? inProgressRecord;
-            const failed: DeviceSyncRecord = {
+                (await getJSON<StoredSyncRecord>(id)) ?? storedRecord;
+            await setSyncRecord(id, {
                 ...existing,
                 status: SyncStatus.FAILED,
-                output: [
-                    ...(existing.output ?? []),
-                    `error:${(err as Error)?.message ?? String(err)}`,
-                ],
-            };
-            await setJSON(id, failed);
+            });
         } finally {
             releaseSyncSlot(id);
         }

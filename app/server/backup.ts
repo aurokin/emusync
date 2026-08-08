@@ -1,10 +1,10 @@
 import { spawn } from "child_process";
 import fs from "node:fs/promises";
-import type { EmuDevice, SyncPair, EmuServer, DeviceSyncRecord } from "./types";
+import type { EmuDevice, SyncPair, EmuServer } from "./types";
 import { SyncType, EmuOs } from "./types";
 import { Client as FtpClient } from "basic-ftp";
 import { getFolderName } from "./utility";
-import { getJSON, setJSON } from "./redis";
+import { appendLog } from "./redis";
 
 // Exported for tests: these two build the literal text of every destructive
 // command, so they are worth asserting directly rather than only through the
@@ -26,10 +26,7 @@ export const buildRm = (path: string, isWindows: boolean = false): string => {
 const appendJobLog = async (jobId: string | undefined, line: string) => {
     if (!jobId) return;
     try {
-        const rec = await getJSON<DeviceSyncRecord>(jobId);
-        if (!rec) return;
-        rec.output.push(line);
-        await setJSON(jobId, rec);
+        await appendLog(jobId, line);
     } catch (e) {
         // Swallow logging errors to avoid breaking command execution
         console.error("appendJobLog error", e);

@@ -5,7 +5,7 @@ import { action } from "./api.device-sync";
 import { initializeServer, getServerState } from "~/server";
 import { connectionTest } from "~/server/backup";
 import { runDeviceSync } from "~/server/actions";
-import { getJSON, setJSON } from "~/server/redis";
+import { getJSON, setSyncRecord, appendLog } from "~/server/redis";
 import {
     tryAcquireSyncSlot,
     releaseSyncSlot,
@@ -26,8 +26,9 @@ vi.mock("~/server/actions", () => ({
 }));
 
 vi.mock("~/server/redis", () => ({
-    setJSON: vi.fn(),
+    setSyncRecord: vi.fn(),
     getJSON: vi.fn(),
+    appendLog: vi.fn(),
 }));
 
 vi.mock("~/server/sync_lock", () => ({
@@ -66,8 +67,9 @@ const mockServerState = (
 ) => getServerStateMock.mockResolvedValue({ devices, serverInfo });
 const connectionTestMock = vi.mocked(connectionTest);
 const runDeviceSyncMock = vi.mocked(runDeviceSync);
-const setJSONMock = vi.mocked(setJSON);
+const setSyncRecordMock = vi.mocked(setSyncRecord);
 const getJSONMock = vi.mocked(getJSON);
+const appendLogMock = vi.mocked(appendLog);
 const tryAcquireSyncSlotMock = vi.mocked(tryAcquireSyncSlot);
 const releaseSyncSlotMock = vi.mocked(releaseSyncSlot);
 const currentSyncJobIdMock = vi.mocked(currentSyncJobId);
@@ -77,10 +79,14 @@ const currentSyncJobIdMock = vi.mocked(currentSyncJobId);
 const flushSyncJob = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const lastRecord = () =>
-    setJSONMock.mock.calls[setJSONMock.mock.calls.length - 1][1] as {
+    setSyncRecordMock.mock.calls[
+        setSyncRecordMock.mock.calls.length - 1
+    ][1] as {
         status: SyncStatus;
-        output: string[];
     };
+
+// Log lines go to the LIST, never into the stored record.
+const loggedLines = () => appendLogMock.mock.calls.flatMap((c) => c.slice(1));
 
 describe("api.device-sync action", () => {
     beforeEach(() => {
@@ -89,8 +95,9 @@ describe("api.device-sync action", () => {
         mockServerState();
         connectionTestMock.mockResolvedValue(true);
         runDeviceSyncMock.mockResolvedValue({ logs: [], failures: [] });
-        setJSONMock.mockResolvedValue(undefined);
+        setSyncRecordMock.mockResolvedValue(undefined);
         getJSONMock.mockResolvedValue(null);
+        appendLogMock.mockResolvedValue(undefined);
         tryAcquireSyncSlotMock.mockReturnValue(true);
         currentSyncJobIdMock.mockReturnValue(null);
     });
@@ -192,6 +199,81 @@ describe("api.device-sync action", () => {
         expect(body.error).toContain("Server info not initialized");
     });
 
+    it("never stores the log inside the record", async () => {
+        // The whole point of the LIST: an `output` field on the record means
+        // every append is a read-modify-write, and concurrent lines are lost.
+        runDeviceSyncMock.mockResolvedValue({
+            logs: [`push:${Emulator.cemu}`],
+            failures: [],
+        });
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        for (const [, value] of setSyncRecordMock.mock.calls) {
+            expect(value).not.toHaveProperty("output");
+        }
+        expect(loggedLines()).toContain(`push:${Emulator.cemu}`);
+    });
+
+    it("still records COMPLETE when the log write fails", async () => {
+        // A Redis blip while appending log lines must not be mistaken for the
+        // sync itself failing: the transfers already succeeded.
+        runDeviceSyncMock.mockResolvedValue({
+            logs: [`push:${Emulator.cemu}`],
+            failures: [],
+        });
+        appendLogMock.mockRejectedValueOnce(new Error("redis blip"));
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(lastRecord().status).toBe(SyncStatus.COMPLETE);
+    });
+
+    it("still records FAILED when the error log write fails", async () => {
+        // The mirror case: losing the error line must not stop the terminal
+        // status from being written at all.
+        runDeviceSyncMock.mockRejectedValue(new Error("boom"));
+        appendLogMock.mockRejectedValueOnce(new Error("redis blip"));
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(lastRecord().status).toBe(SyncStatus.FAILED);
+        expect(releaseSyncSlotMock).toHaveBeenCalledWith("job-1");
+    });
+
+    it("logs the error when the job throws", async () => {
+        runDeviceSyncMock.mockRejectedValue(new Error("boom"));
+
+        await callAction({
+            deviceName: "Alpha",
+            emulatorActions: [
+                { emulator: Emulator.cemu, action: SyncAction.push },
+            ],
+        });
+        await flushSyncJob();
+
+        expect(loggedLines()).toContain("error:boom");
+        expect(lastRecord().status).toBe(SyncStatus.FAILED);
+    });
+
     it("returns in-progress response", async () => {
         const response = await callAction({
             deviceName: "Alpha",
@@ -202,7 +284,7 @@ describe("api.device-sync action", () => {
 
         const body = await response.json();
         expect(body.deviceSyncRecord.status).toBe(SyncStatus.IN_PROGRESS);
-        expect(setJSONMock).toHaveBeenCalled();
+        expect(setSyncRecordMock).toHaveBeenCalled();
     });
 
     it("records FAILED when any emulator failed", async () => {
@@ -221,9 +303,8 @@ describe("api.device-sync action", () => {
         });
         await flushSyncJob();
 
-        const record = lastRecord();
-        expect(record.status).toBe(SyncStatus.FAILED);
-        expect(record.output).toContain(`FAILED: ${Emulator.cemu}`);
+        expect(lastRecord().status).toBe(SyncStatus.FAILED);
+        expect(loggedLines()).toContain(`FAILED: ${Emulator.cemu}`);
     });
 
     it("records COMPLETE when nothing failed", async () => {
@@ -277,7 +358,7 @@ describe("api.device-sync action", () => {
     it("releases the sync slot when the job record cannot be written", async () => {
         // Otherwise the lock is held with no job running behind it, and every
         // later sync 409s until the lease expires.
-        setJSONMock.mockRejectedValueOnce(new Error("redis down"));
+        setSyncRecordMock.mockRejectedValueOnce(new Error("redis down"));
 
         const response = await callAction({
             deviceName: "Alpha",
