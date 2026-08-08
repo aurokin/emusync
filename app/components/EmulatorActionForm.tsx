@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import Typography from "@mui/material/Typography";
 import Box from "@mui/material/Box";
 import { useDevices } from "~/contexts/DeviceContext";
@@ -6,6 +6,10 @@ import type { EmulatorAction } from "~/types/emulatorAction";
 import type { DeviceSyncRequest, DeviceSyncResponse } from "~/types/device";
 import { SyncStatus } from "~/types/device";
 import { capitalize } from "~/utilities/utils";
+
+// One bad response should not abandon a running job, but the UI must not
+// pretend to be watching forever either.
+const MAX_POLL_FAILURES = 3;
 
 function TerminalLoader() {
     return (
@@ -57,10 +61,35 @@ export function EmulatorActionForm() {
     } = useDevices();
 
     const outputRef = useRef<HTMLPreElement | null>(null);
+    // Anything that stops a sync from being observed: a rejected POST, a
+    // conflicting job, or polling losing contact. Previously all of these were
+    // console.error only, so a failed request looked exactly like a click that
+    // never registered.
+    const [syncError, setSyncError] = useState<string | null>(null);
 
     const selectedDeviceData = devices.find(
         (device) => device.name === selectedDevice,
     );
+
+    // Device switching is intentionally allowed mid-sync (gating it on
+    // requestInProgress is what used to make the UI unrecoverable). That means
+    // an in-flight POST or poll can resolve after the selection moved on, so
+    // every async write below is guarded against landing on the wrong device.
+    // Matching on device name alone is not enough: going Alpha -> Beta -> Alpha
+    // and submitting again would revalidate the abandoned first request. A
+    // generation bumped on every submit and every selection change identifies
+    // exactly one live request.
+    // Every async write below — POST and poll alike — is checked against it,
+    // rather than against effect lifetime: the poll effect does not depend on
+    // selectedDevice, so a switch does not tear it down, and unmounting the
+    // form (deselecting the card) tears down no POST at all.
+    const requestGenRef = useRef(0);
+    useEffect(() => {
+        requestGenRef.current += 1;
+        return () => {
+            requestGenRef.current += 1;
+        };
+    }, [selectedDevice]);
 
     useEffect(() => {
         if (selectedDeviceData) {
@@ -72,6 +101,7 @@ export function EmulatorActionForm() {
         }
         setDeviceSyncResponse(null);
         setRequestInProgress(false);
+        setSyncError(null);
     }, [
         selectedDeviceData,
         setDeviceSyncResponse,
@@ -87,15 +117,19 @@ export function EmulatorActionForm() {
     };
 
     const handleSubmit = async () => {
+        const requestedDevice = selectedDeviceData!.name;
         const payload: DeviceSyncRequest = {
-            deviceName: selectedDeviceData!.name,
+            deviceName: requestedDevice,
             emulatorActions: Object.entries(emulatorActions)
                 .filter(([, action]) => action !== "ignore")
                 .map(([emulator, action]) => ({ emulator, action })),
         };
+        const generation = ++requestGenRef.current;
+        const isCurrent = () => requestGenRef.current === generation;
 
         try {
             setDeviceSyncResponse(null);
+            setSyncError(null);
             setRequestInProgress(true);
             const res = await fetch("/api/device-sync", {
                 method: "POST",
@@ -103,15 +137,34 @@ export function EmulatorActionForm() {
                 body: JSON.stringify(payload),
             });
             if (!res.ok) {
-                throw new Error(`HTTP ${res.status}`);
+                // The server explains itself (409 names the in-flight job, 404
+                // an unknown device); show that rather than a bare status.
+                const detail = await res
+                    .json()
+                    .then((body) => (body as { error?: string }).error)
+                    .catch(() => undefined);
+                throw new Error(
+                    detail ?? `Request failed (HTTP ${res.status})`,
+                );
             }
             const data = (await res.json()) as DeviceSyncResponse;
+            // The job is running server-side either way; only the display is
+            // dropped if the user has moved to another device.
+            if (!isCurrent()) return;
             setDeviceSyncResponse(data);
         } catch (err) {
             console.error("Failed to request device sync", err);
+            if (!isCurrent()) return;
+            setSyncError(
+                err instanceof Error ? err.message : "Failed to start sync",
+            );
             setRequestInProgress(false);
         }
     };
+
+    // Deselecting the card unmounts this form. Nothing is left to observe the
+    // job, so leaving the shared flag set would grey out every device card.
+    useEffect(() => () => setRequestInProgress(false), [setRequestInProgress]);
 
     useEffect(() => {
         if (
@@ -120,6 +173,19 @@ export function EmulatorActionForm() {
                 SyncStatus.IN_PROGRESS
         ) {
             const id = deviceSyncResponse.id;
+            // A poll issued before the user switched devices (or before this
+            // effect was torn down) must not write into the new selection.
+            // Both conditions are needed: this effect keys on the response, so
+            // a device switch alone does not run its cleanup.
+            const generation = requestGenRef.current;
+            let cancelled = false;
+            // Overlapping polls also need ordering: once one of them has seen a
+            // terminal status, a slower sibling's failure must not paint "lost
+            // contact" over a job that finished.
+            let settled = false;
+            const stale = () =>
+                cancelled || settled || requestGenRef.current !== generation;
+            let consecutiveFailures = 0;
             const interval = setInterval(async () => {
                 try {
                     const res = await fetch(`/api/device-sync/${id}`);
@@ -127,20 +193,62 @@ export function EmulatorActionForm() {
                         throw new Error(`HTTP ${res.status}`);
                     }
                     const data = (await res.json()) as DeviceSyncResponse;
+                    if (stale()) return;
                     setDeviceSyncResponse(data);
+                    // Polls overlap, so a slow success can land after a faster
+                    // failure; a recovered poll must retract the stale alert.
+                    consecutiveFailures = 0;
+                    setSyncError(null);
                     if (
                         data.deviceSyncRecord.status !== SyncStatus.IN_PROGRESS
                     ) {
+                        settled = true;
                         clearInterval(interval);
+                    } else {
+                        // The failure that cleared this flag may have been the
+                        // overlapping poll we just recovered from; the job is
+                        // demonstrably still running, so re-arm the UI.
+                        setRequestInProgress(true);
                     }
                 } catch (e) {
+                    if (stale()) return;
                     console.error("Polling device sync failed", e);
-                    clearInterval(interval);
+                    // An expired record will not come back; anything else may
+                    // be one bad response, so keep watching for a few rounds
+                    // rather than abandoning a running job on a blip.
+                    const expired =
+                        e instanceof Error && e.message.includes("404");
+                    consecutiveFailures += 1;
+                    const givingUp =
+                        expired || consecutiveFailures >= MAX_POLL_FAILURES;
+                    setSyncError(
+                        expired
+                            ? "Lost track of this sync job — its record expired. The sync may still be running on the server; check the device before retrying."
+                            : `Lost contact with the sync job: ${
+                                  e instanceof Error ? e.message : String(e)
+                              }${
+                                  givingUp
+                                      ? " — stopped watching it. The sync may still be running on the server."
+                                      : " — retrying."
+                              }`,
+                    );
+                    if (givingUp) {
+                        // Not settled: a poll still in flight may yet answer,
+                        // and it is allowed to take the controls back. Leaving
+                        // this flag set was the original bug — Execute, Reset
+                        // and device selection stayed disabled forever, with a
+                        // page reload the only way out.
+                        clearInterval(interval);
+                        setRequestInProgress(false);
+                    }
                 }
             }, 3000);
-            return () => clearInterval(interval);
+            return () => {
+                cancelled = true;
+                clearInterval(interval);
+            };
         }
-    }, [deviceSyncResponse, setDeviceSyncResponse]);
+    }, [deviceSyncResponse, setDeviceSyncResponse, setRequestInProgress]);
 
     useEffect(() => {
         if (!deviceSyncResponse) return;
@@ -166,9 +274,11 @@ export function EmulatorActionForm() {
             emulatorActions[emu] === "push" || emulatorActions[emu] === "pull",
     );
     const isActionDisabled = requestInProgress || !hasActions;
+    // Reset stays available whenever nothing is actually running. Gating it on
+    // the last status alone meant a job whose polling died left Reset disabled
+    // with no running sync behind it.
     const isResetDisabled =
-        !deviceSyncResponse ||
-        deviceSyncResponse.deviceSyncRecord.status === SyncStatus.IN_PROGRESS;
+        requestInProgress || (!deviceSyncResponse && !syncError);
     const statusColor = deviceSyncResponse
         ? deviceSyncResponse.deviceSyncRecord.status === SyncStatus.IN_PROGRESS
             ? "#f6c177"
@@ -460,8 +570,13 @@ export function EmulatorActionForm() {
                                     resetActions[emulator] = "ignore";
                                 },
                             );
+                            // Anything still in flight belongs to the state the
+                            // user just cleared; invalidate it now so it cannot
+                            // repopulate the form.
+                            requestGenRef.current += 1;
                             setEmulatorActions(resetActions);
                             setDeviceSyncResponse(null);
+                            setSyncError(null);
                         }}
                         disabled={isResetDisabled}
                         sx={{
@@ -544,6 +659,24 @@ export function EmulatorActionForm() {
                         )}
                     </Box>
                 </Box>
+
+                {syncError && (
+                    <Box
+                        role="alert"
+                        sx={{
+                            mt: 2.5,
+                            px: 2,
+                            py: 1.5,
+                            borderRadius: "12px",
+                            border: "1px solid rgba(242, 143, 173, 0.5)",
+                            backgroundColor: "rgba(242, 143, 173, 0.12)",
+                            color: "#f28fad",
+                            fontSize: "0.8rem",
+                        }}
+                    >
+                        {syncError}
+                    </Box>
+                )}
             </Box>
 
             {deviceSyncResponse && (

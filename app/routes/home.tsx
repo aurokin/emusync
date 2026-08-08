@@ -217,15 +217,21 @@ export default function Home() {
                             <Box
                                 key={device.name}
                                 onClick={() => {
-                                    if (requestInProgress) return;
+                                    // Deliberately not gated on
+                                    // requestInProgress: a stuck flag used to
+                                    // make the device list unclickable, and a
+                                    // reload was the only escape. The server
+                                    // rejects a concurrent sync with 409, so
+                                    // switching devices here is safe.
                                     setSelectedDevice(
                                         isSelected ? null : device.name,
                                     );
                                 }}
                                 sx={{
-                                    cursor: requestInProgress
-                                        ? "not-allowed"
-                                        : "pointer",
+                                    cursor: "pointer",
+                                    // Dim the others during a sync as a hint
+                                    // that one is running, but they stay
+                                    // clickable — see the onClick note above.
                                     opacity:
                                         requestInProgress && !isSelected
                                             ? 0.6
