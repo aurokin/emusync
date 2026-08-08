@@ -3,6 +3,21 @@ import globals from "globals";
 import jsxA11y from "eslint-plugin-jsx-a11y";
 import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
+// This import is what pins the repo to TypeScript 5/6.
+//
+// typescript-eslint 8.66.0 (the newest release as of 2026-08-08) throws at
+// module load on any TypeScript with a major >= 7 — an unconditional
+// `if (versionMajor >= 7)` in its dist/index.js, not a suppressible warning.
+// `bunx eslint .` exits 2 before evaluating this config at all.
+//
+// Verified with typescript@7.0.2 in a scratch clone: `bunx tsc --noEmit`
+// exits 0, so the source tree itself is already TS 7 clean and TypeScript is
+// not the blocker — lint is. Upstream tracks TS >= 7.1 support in
+// typescript-eslint#10940; their interim suggestion is running the linter
+// against the TS 6 API side by side.
+//
+// Re-test by bumping typescript in a throwaway clone and running the two
+// commands above. Do not bump typescript here until that lint run passes.
 import tseslint from "typescript-eslint";
 import { createRequire } from "node:module";
 

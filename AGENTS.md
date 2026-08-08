@@ -77,6 +77,13 @@ deliberate decision that looks like a bug. Do not "fix" them without asking.
   absent: the relative `paths` mappings do not need it on TypeScript 5.9, and
   leaving it out is what lets the tree compile under TypeScript 7, which
   removed the option outright.
+- **TypeScript stays on 5.x, and lint is the reason.** The tree itself is
+  already TS 7 clean — verified with `typescript@7.0.2` in a scratch clone,
+  where `tsc --noEmit` exits 0. `typescript-eslint` 8.66.0 is what blocks
+  the bump: it throws at module load on any TypeScript major >= 7, so
+  `bun run lint` dies before reading `eslint.config.js`. The full reasoning
+  and the re-test recipe are commented at the `typescript-eslint` import in
+  `eslint.config.js`. Upstream issue: typescript-eslint#10940.
 - Prettier settings are in `.prettierrc` (`tabWidth: 4`). Note `proseWrap`
   is unset, so Prettier will not rewrap Markdown prose; wrap it yourself.
 - ESLint config is in `eslint.config.js`; Tailwind has no standalone config.
