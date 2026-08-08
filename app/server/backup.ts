@@ -6,14 +6,17 @@ import { Client as FtpClient } from "basic-ftp";
 import { getFolderName } from "./utility";
 import { getJSON, setJSON } from "./redis";
 
-const esc = (s: string, isWindows: boolean = false): string => {
+// Exported for tests: these two build the literal text of every destructive
+// command, so they are worth asserting directly rather than only through the
+// sequences below.
+export const esc = (s: string, isWindows: boolean = false): string => {
     if (isWindows) {
         return `"${s}"`;
     }
     return s.replace(/ /g, "\\ ");
 };
 
-const buildRm = (path: string, isWindows: boolean = false): string => {
+export const buildRm = (path: string, isWindows: boolean = false): string => {
     if (isWindows) {
         return `if (Test-Path -Path ${path} -PathType Container) { rm -r ${path} }`;
     }

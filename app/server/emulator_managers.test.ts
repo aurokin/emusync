@@ -226,3 +226,103 @@ describe("emulator managers", () => {
         ).toBe("/srv/pcsx2/memcards");
     });
 });
+
+// Every Emulator value, both directions, with every device path populated.
+// Nine of the sixteen managers previously had no test at all, and retroarch
+// was only exercised through the muos branch — not the desktop/android mapping
+// that herb, haste, odin and thor actually use.
+describe("emulator pair matrix", () => {
+    const fullDevice = buildDevice({
+        os: EmuOs.linux,
+        cemuSave: "/dev/cemu",
+        azahar: "/dev/azahar",
+        dolphinGC: "/dev/GC",
+        dolphinWii: "/dev/Wii",
+        mupenFzSave: "/dev/mupen",
+        melonds: "/dev/melonds",
+        nethersx2Save: "/dev/nsx2",
+        pcsx2Save: "/dev/pcsx2",
+        ppssppSave: "/dev/psp/save",
+        ppssppState: "/dev/psp/state",
+        retroarchSave: "/dev/ra/saves",
+        retroarchState: "/dev/ra/states",
+        rpcs3Save: "/dev/rpcs3",
+        ryujinxSave: "/dev/ryujinx",
+        switchSave: "/dev/switch",
+        vita3kSave: "/dev/vita3k",
+        xemuSave: "/dev/xemu",
+        xeniaSave: "/dev/xenia",
+        yuzuSave: "/dev/yuzu",
+    });
+    const serverInfo = buildServer();
+
+    // source/target for push; pull is asserted as the exact mirror image.
+    const expected: Record<Emulator, [string, string][]> = {
+        [Emulator.cemu]: [["/srv/cemu", "/dev/cemu"]],
+        [Emulator.azahar]: [
+            ["/srv/azahar/nand", "/dev/azahar/nand"],
+            ["/srv/azahar/sdmc", "/dev/azahar/sdmc"],
+            ["/srv/azahar/sysdata", "/dev/azahar/sysdata"],
+        ],
+        [Emulator.dolphin]: [
+            ["/srv/dolphin/GC", "/dev/GC"],
+            ["/srv/dolphin/Wii", "/dev/Wii"],
+        ],
+        [Emulator.mupen]: [["/srv/mupen", "/dev/mupen"]],
+        [Emulator.melonds]: [["/srv/melonds", "/dev/melonds"]],
+        [Emulator.nethersx2]: [
+            ["/srv/nethersx2/memcards", "/dev/nsx2/memcards"],
+        ],
+        [Emulator.pcsx2]: [["/srv/nethersx2/memcards", "/dev/pcsx2"]],
+        [Emulator.ppsspp]: [
+            ["/srv/ppsspp", "/dev/psp/save"],
+            ["/srv/ppsspp/state", "/dev/psp/state"],
+        ],
+        [Emulator.retroarch]: [
+            ["/srv/retroarch", "/dev/ra/saves"],
+            ["/srv/retroarch/state", "/dev/ra/states"],
+        ],
+        [Emulator.rpcs3]: [["/srv/rpcs3", "/dev/rpcs3"]],
+        [Emulator.ryujinx]: [["/srv/ryujinx", "/dev/ryujinx"]],
+        [Emulator.switch]: [["/srv/switch", "/dev/switch"]],
+        [Emulator.vita3k]: [["/srv/vita3k", "/dev/vita3k"]],
+        [Emulator.xemu]: [["/srv/xemu", "/dev/xemu"]],
+        [Emulator.xenia]: [["/srv/xenia", "/dev/xenia"]],
+        [Emulator.yuzu]: [["/srv/yuzu", "/dev/yuzu"]],
+    };
+
+    it("covers every emulator in the enum", () => {
+        // Guards the table itself: a new Emulator must be added here too.
+        expect(Object.keys(expected).sort()).toEqual(
+            Object.values(Emulator).sort(),
+        );
+    });
+
+    it.each(Object.values(Emulator))("maps %s on push", (emulator) => {
+        const pairs = getManageFn(emulator)(fullDevice, serverInfo, true);
+        expect(pairs).toEqual(
+            expected[emulator].map(([source, target]) => ({ source, target })),
+        );
+    });
+
+    it.each(Object.values(Emulator))("maps %s on pull", (emulator) => {
+        const pairs = getManageFn(emulator)(fullDevice, serverInfo, false);
+        expect(pairs).toEqual(
+            expected[emulator].map(([serverPath, devicePath]) => ({
+                source: devicePath,
+                target: serverPath,
+            })),
+        );
+    });
+
+    it.each(Object.values(Emulator))(
+        "produces no pairs for %s when the device has no path",
+        (emulator) => {
+            // An unconfigured emulator must sync nothing rather than build a
+            // pair against undefined.
+            const bare = buildDevice({ os: EmuOs.linux });
+            expect(getManageFn(emulator)(bare, serverInfo, true)).toEqual([]);
+            expect(getManageFn(emulator)(bare, serverInfo, false)).toEqual([]);
+        },
+    );
+});

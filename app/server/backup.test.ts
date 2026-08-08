@@ -65,17 +65,25 @@ const buildDevice = (overrides: Partial<EmuDevice> = {}): EmuDevice => ({
 
 const killMock = vi.fn();
 
+// Emits "exit" as a microtask, not via setTimeout.
+//
+// setTimeout is a macrotask, so it always fires after the microtask queue has
+// drained — meaning a handler attached after any number of awaits still saw
+// the event, and the mock structurally could not reproduce the hang that took
+// the app down once (createCmd awaited a Redis write between spawn() and
+// attaching the exit handler). Resolving a promise instead makes the ordering
+// realistic: attach late and the event is missed, exactly as in production.
 const mockSpawn = (stderrMessage?: string, exitCode = 0) => {
     spawnMocks.spawn.mockImplementation(() => {
         const emitter = new EventEmitter();
         const stdout = new EventEmitter();
         const stderr = new EventEmitter();
-        if (stderrMessage) {
-            setTimeout(() => {
+        void Promise.resolve().then(() => {
+            if (stderrMessage) {
                 stderr.emit("data", Buffer.from(stderrMessage));
-            }, 0);
-        }
-        setTimeout(() => emitter.emit("exit", exitCode), 0);
+            }
+            emitter.emit("exit", exitCode);
+        });
         return {
             stdout,
             stderr,
@@ -241,4 +249,125 @@ describe("sync pair ordering", () => {
 
         expect(ranCommands()[0]).toBe("rm -rf /srv/emu\\ sync/work");
     });
+
+    it("emits the exact push sequence for a linux device", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+
+        await backup.pushPairs(device, pairs);
+
+        expect(ranCommands()).toEqual([
+            "ssh -p 22 root@10.0.0.10 'rm -rf /tmp/work'",
+            "ssh -p 22 root@10.0.0.10 'mkdir /tmp/work'",
+            "scp -P 22 -r /srv/a root@10.0.0.10:/tmp/work",
+            "ssh -p 22 root@10.0.0.10 'rm -rf /device/a'",
+            "ssh -p 22 root@10.0.0.10 'mv /tmp/work/a /device/a'",
+            "scp -P 22 -r /srv/b root@10.0.0.10:/tmp/work",
+            "ssh -p 22 root@10.0.0.10 'rm -rf /device/b'",
+            "ssh -p 22 root@10.0.0.10 'mv /tmp/work/b /device/b'",
+        ]);
+    });
+
+    it("emits the exact pull sequence for a linux device", async () => {
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/work" } as EmuServer;
+
+        await backup.pullPairs(device, pairs, serverInfo);
+
+        expect(ranCommands()).toEqual([
+            "rm -rf /srv/work",
+            "mkdir -p /srv/work",
+            "scp -P 22 -r root@10.0.0.10:/srv/a /srv/work",
+            "rm -rf /device/a",
+            "mv /srv/work/a /device/a",
+            "scp -P 22 -r root@10.0.0.10:/srv/b /srv/work",
+            "rm -rf /device/b",
+            "mv /srv/work/b /device/b",
+        ]);
+    });
+
+    // haste is a Windows device, so this branch runs in production. It had no
+    // coverage at all: buildRm emits PowerShell here, and esc quotes instead
+    // of backslash-escaping.
+    it("emits PowerShell deletes and quoted paths for a windows device", async () => {
+        const device = buildDevice({
+            os: EmuOs.windows,
+            syncType: SyncType.ssh,
+            workDir: "C:/Users/auro/.emusync_tmp",
+        });
+
+        await backup.pushPairs(device, [
+            { source: "/srv/retroarch", target: "D:/RetroArch/saves" },
+        ]);
+
+        expect(ranCommands()).toEqual([
+            `ssh -p 22 root@10.0.0.10 'if (Test-Path -Path "C:/Users/auro/.emusync_tmp" -PathType Container) { rm -r "C:/Users/auro/.emusync_tmp" }'`,
+            "ssh -p 22 root@10.0.0.10 'mkdir C:/Users/auro/.emusync_tmp'",
+            "scp -P 22 -r /srv/retroarch root@10.0.0.10:C:/Users/auro/.emusync_tmp",
+            `ssh -p 22 root@10.0.0.10 'if (Test-Path -Path "D:/RetroArch/saves" -PathType Container) { rm -r "D:/RetroArch/saves" }'`,
+            `ssh -p 22 root@10.0.0.10 'mv C:/Users/auro/.emusync_tmp/retroarch "D:/RetroArch/saves"'`,
+        ]);
+    });
+
+    it("does not delete any target after a transfer fails", async () => {
+        // The point of interleaving: a failed scp must abort before the rm -rf
+        // that would follow it, and must never reach the second pair.
+        const device = buildDevice({ syncType: SyncType.ssh });
+        const serverInfo = { workDir: "/srv/work" } as EmuServer;
+        spawnMocks.spawn.mockImplementation((_bin, args) => {
+            const cmd = (args as string[])[1];
+            const emitter = new EventEmitter();
+            const stdout = new EventEmitter();
+            const stderr = new EventEmitter();
+            void Promise.resolve().then(() =>
+                emitter.emit("exit", cmd.includes("scp") ? 1 : 0),
+            );
+            return {
+                stdout,
+                stderr,
+                on: emitter.on.bind(emitter),
+                kill: killMock,
+            } as never;
+        });
+
+        await expect(
+            backup.pullPairs(device, pairs, serverInfo),
+        ).rejects.toThrow(/Command failed/);
+
+        const deletes = ranCommands().filter(
+            (c) => c.startsWith("rm -rf") && c.includes("/device/"),
+        );
+        expect(deletes).toEqual([]);
+        expect(ranCommands().some((c) => c.includes("/srv/b"))).toBe(false);
+    });
+});
+
+describe("command string builders", () => {
+    it("escapes spaces for posix and quotes for windows", () => {
+        expect(backup.esc("/srv/emu sync/work")).toBe("/srv/emu\\ sync/work");
+        expect(backup.esc("D:/Program Files/saves", true)).toBe(
+            `"D:/Program Files/saves"`,
+        );
+    });
+
+    it("builds a guarded recursive delete for windows", () => {
+        expect(backup.buildRm("/srv/work")).toBe("rm -rf /srv/work");
+        expect(backup.buildRm(`"D:/saves"`, true)).toBe(
+            `if (Test-Path -Path "D:/saves" -PathType Container) { rm -r "D:/saves" }`,
+        );
+    });
+});
+
+describe("createCmd event timing", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockSpawn();
+    });
+
+    // Regression for the bug that hung every sync in production: createCmd
+    // awaited a Redis write between spawn() and attaching the exit handler, so
+    // a fast command exited unobserved. Fails by timeout if handlers are ever
+    // attached after an await again.
+    it("observes an exit that happens while the job log write is pending", async () => {
+        await expect(backup.createCmd("true", "job-1")).resolves.toBe(0);
+    }, 1000);
 });
