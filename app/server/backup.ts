@@ -321,6 +321,14 @@ export const pushPairs = async (
             jobId,
         );
     } else {
+        // Known slow, not yet measured: scp -r costs a round trip per file, so
+        // the devices that land here (the ones without rsync — odin, thor) pay
+        // the most on save directories made of many tiny files, which is the
+        // common shape. Tarring the pair, moving one file and extracting on the
+        // far side would likely be a large win. Get real timings off an odin
+        // sync before designing it, and note this is unrelated to the Dolphin
+        // Android zip in actions.ts, which crosses the app-private storage
+        // boundary rather than chasing throughput.
         const isWindows = device.os === EmuOs.windows;
         const setupCmds = [
             buildSshCommand(
