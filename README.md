@@ -136,6 +136,11 @@ changing the sync engine.
 
 ## Deployment
 
+`bun run start` runs `server.ts`, a small Bun server rather than
+`react-router-serve`. It serves `build/client` and hands everything else to
+the app, and it exits on SIGTERM instead of waiting for an event loop that
+the Redis connection never lets drain. See the comments in `server.ts`.
+
 The fleet runs it under systemd from a checkout; see
 `deploy/emusync.service`. Deploying is:
 

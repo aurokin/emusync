@@ -49,6 +49,17 @@ deliberate decision that looks like a bug. Do not "fix" them without asking.
   omits `output` so no writer can persist a competing copy. Appending to an
   array inside the record is what this replaced: it was a read-modify-write
   that silently dropped concurrent lines.
+- **`server.ts` is hand-rolled on purpose; do not reinstall
+  `@react-router/serve`.** Two things it fixes. It sets `NODE_ENV` before
+  importing anything that reaches React — static imports evaluate ahead of
+  the module body, and getting this wrong loads React's development build
+  against react-dom's production one, which kills SSR on every HTML route
+  while static assets keep serving. And it exits explicitly on SIGTERM
+  rather than waiting for the event loop: the Redis client's socket holds
+  the loop open forever, lives inside the bundled build where `server.ts`
+  cannot reach it, and made every restart a 90s SIGKILL (measured). The
+  containment check for static paths lives in `app/server/static.ts` so it
+  can be tested without booting a listener.
 - **`eslint.config.js` reads the installed React version** instead of using
   `"detect"`. Reverting that to `"detect"` breaks every ESLint 10 run — the
   plugin's detection path calls an API ESLint 10 removed.

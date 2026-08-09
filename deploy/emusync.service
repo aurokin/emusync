@@ -16,6 +16,11 @@ Environment=REDIS_URL=redis://localhost:6379
 Environment=PATH=/home/auro/.bun/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/auro/.bun/bin/bun run start
 Restart=on-failure
+# Backstop only. server.ts exits itself within SHUTDOWN_GRACE_MS (5s), so this
+# should never fire. It is here because the previous server never exited at
+# all — the Redis socket held the event loop open — and the default 90s
+# timeout turned every restart into a 90s outage ending in SIGKILL.
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

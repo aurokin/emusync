@@ -21,9 +21,10 @@ cleanup() {
     # while the shell is in the sleep below) used to abort it part-way and
     # leave the server running.
     trap "" INT TERM
-    # Kill the group, not the pid: `bun run start` execs bunx which spawns
-    # node, and killing only bun leaves the server listening. Trapping TERM
-    # and INT as well matters because CI wraps this in a timeout.
+    # Kill the group, not the pid: `bun run start` spawns the server as a
+    # child, so killing only the `bun run` wrapper leaves it listening.
+    # Trapping TERM and INT as well matters because CI wraps this in a
+    # timeout.
     if [ -n "$server_pid" ]; then
         kill -TERM -- "-$server_pid" 2>/dev/null || true
         sleep 1
